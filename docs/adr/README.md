@@ -116,3 +116,4 @@ of the law is what it is.
 | [0072](0072-shared-reality-selector-requires-vless-authorization.md) | A shared REALITY selector requires VLESS user authorization | Accepted |
 | [0073](0073-local-panel-accounting-boundary.md) | Keep panel accounting on a local read-only boundary | Accepted |
 | [0074](0074-attribute-tcp-protocol-proof-to-verified-proxy-source.md) | Attribute TCP protocol proof to a verified PROXY source | Accepted |
+| [0075](0075-import-wsq-features-through-owned-protocol-boundaries.md) | Import external proxy features through owned protocol boundaries | Accepted |

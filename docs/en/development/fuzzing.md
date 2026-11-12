@@ -26,7 +26,8 @@ sharded smoke passes over all targets on every PR. The current set covers:
 - TLS 1.3 record open/seal, post-handshake KeyUpdate reconstruction, and
   transcript-hash differential (`tls13_record`, `key_update`, `transcript_diff`);
 - configuration JSON deserialization on the exact `load_config` decode path
-  (`config_json`, `config_diagnostic`);
+  (`config_json`, `config_diagnostic`), plus the DNS server and DNS-over-TLS
+  endpoint parser (`dns_server_spec`);
 - local panel session-control command parsing (`management_command`);
 - first decrypted TCP BitTorrent handshake prefix across fragment boundaries
   (`bittorrent_prefix`);

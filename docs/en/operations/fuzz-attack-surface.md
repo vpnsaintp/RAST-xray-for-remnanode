@@ -31,6 +31,7 @@ are exercised by `wire_parsers`, including preservation of trailing payload.
 | TLS 1.3 post-handshake KeyUpdate reconstruction and record-boundary enforcement | `tls13::fuzz_key_update_fragments` | `key_update` |
 | Handshake transcript hash | `TranscriptHasher` vs `HashAlgorithm::digest` | `transcript_diff` (differential: incremental == one-shot for all chunkings) |
 | Config JSON deserialization + normalization + validation | `config::fuzz_decode_config` (exact `load_config` decode path) | `config_json` (structured generator via `arbitrary`, all values synthetic) |
+| DNS upstream endpoint and TLS identity syntax | `server::dns::parse_server_spec` | `dns_server_spec` (raw input and forced TLS prefix) |
 | REALITY authentication round trip | REALITY auth handshake | `reality_auth_round_trip` |
 | Session-engine semantics | `rr-session` state machines including `ClientRace` | `session_semantics` |
 | Configuration diagnostics | diagnostic rendering on malformed config | `config_diagnostic` |

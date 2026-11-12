@@ -877,6 +877,12 @@ fn validate_dns(dns: Option<&DnsConfig>, direct_source_ip: bool) -> Result<(), S
         let default_dns = DnsConfig::default();
         for (index, server) in dns.unwrap_or(&default_dns).servers().iter().enumerate() {
             let server = server.trim();
+            match super::node::dns::parse_dot_server_spec(server) {
+                Ok(Some(dot)) if dot.address.is_ipv4() => continue,
+                Ok(Some(_)) => {}
+                Err(reason) => return fail(format!("dns.servers[{index}]"), reason),
+                Ok(None) => {}
+            }
             if server.parse::<std::net::Ipv4Addr>().is_err()
                 && server.parse::<std::net::SocketAddrV4>().is_err()
             {
@@ -912,6 +918,11 @@ fn validate_dns(dns: Option<&DnsConfig>, direct_source_ip: bool) -> Result<(), S
         if !uses_system {
             for (index, server) in servers.iter().enumerate() {
                 let path = format!("dns.servers[{index}]");
+                match super::node::dns::parse_dot_server_spec(server) {
+                    Ok(Some(_)) => continue,
+                    Err(reason) => return fail(path, reason),
+                    Ok(None) => {}
+                }
                 // A bare address is allowed; a port makes it an endpoint.
                 if server.parse::<std::net::IpAddr>().is_ok() {
                     continue;

@@ -152,8 +152,11 @@ SOCKS5/NXR/Handoff 服务器名。数字字面量不会进入它。两种后端�
 - **system**（默认，`dns.servers: ["system"]`）：操作系统解析器（getaddrinfo），
   运行在有界阻塞池上。因为 getaddrinfo 不提供 TTL，该模式绝不缓存动态应答——
   只有 singleflight 合并、绝对超时和准入治理生效。
-- **上游列表**：内置 DNS 协议解析器（hickory，UDP 加 TCP 回退）面向配置的服务器；
-  主机名条目在启动时经系统解析器引导解析一次。缓存的阳性和阴性应答携带按
+- **上游列表**：内置 DNS 协议解析器（hickory，UDP 加 TCP 回退，或验证证书的
+  DNS over TLS）面向配置的服务器。普通主机名条目在启动时经系统解析器引导解析
+  一次。TLS 条目使用 `tls://server-name/numeric-ip[:port]`（默认端口 853），
+  例如 `tls://dns.google/8.8.8.8`；单独指定数字地址可避免在设置了
+  `network.directSourceIp` 的节点上发生未绑定源 IP 的引导查询。缓存的阳性和阴性应答携带按
   `dns.cache` 钳制后的真实上游 TTL（`minTtlSeconds`/`maxTtlSeconds`；阴性应答只有
   在 SOA TTL 支持时才缓存，上限 `negativeTtlSeconds`）。`system` 与上游服务器混用
   会在校验时拒绝。

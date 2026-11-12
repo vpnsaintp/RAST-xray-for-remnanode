@@ -1,0 +1,557 @@
+--- a/src/modules/rust-core/rust-core.service.ts
++++ b/src/modules/rust-core/rust-core.service.ts
+@@ -82,6 +82,32 @@
+             const outboundTag = String((outbounds[0] as Record<string, unknown>).tag ?? '');
+             if (!inboundTag || !outboundTag) throw new Error('Panel stat tags are missing');
+             if (base.role === 'entry') {
++                // Remnawave owns the REALITY short IDs advertised to clients.
++                // Import them only when the operator template has no shared
++                // IDs; otherwise the operator's explicit choice remains in
++                // force. Do not invent an ID that no client can use.
++                const reality = base.reality as Record<string, unknown> | undefined;
++                if (!reality || typeof reality !== 'object' || Array.isArray(reality)) {
++                    throw new Error('Rust entry template has no REALITY settings');
++                }
++                if (!Array.isArray(reality.sharedShortIds) || !reality.sharedShortIds.length) {
++                    const stream = inbounds[0].streamSettings as
++                        | Record<string, unknown>
++                        | undefined;
++                    const settings = stream?.realitySettings as Record<string, unknown> | undefined;
++                    const panelShortIds = settings?.shortIds;
++                    if (Array.isArray(panelShortIds) && panelShortIds.length) {
++                        if (
++                            panelShortIds.some(
++                                (id) =>
++                                    typeof id !== 'string' || !/^(?:[0-9a-fA-F]{2}){1,8}$/.test(id),
++                            )
++                        ) {
++                            throw new Error('Panel REALITY short IDs are malformed');
++                        }
++                        reality.sharedShortIds = [...panelShortIds];
++                    }
++                }
+                 const existing = new Map(
+                     (Array.isArray(base.users) ? base.users : [])
+                         .filter((user): user is Record<string, unknown> =>
+@@ -95,6 +121,16 @@
+                     shortIds: existing.get(user.id)?.shortIds ?? [],
+                     panelUserId: user.panelUserId,
+                 }));
++                if (
++                    (base.users as Record<string, unknown>[]).some(
++                        (user) => !Array.isArray(user.shortIds) || !user.shortIds.length,
++                    ) &&
++                    (!Array.isArray(reality.sharedShortIds) || !reality.sharedShortIds.length)
++                ) {
++                    throw new Error(
++                        'Rust entry needs panel REALITY short IDs or operator sharedShortIds',
++                    );
++                }
+             } else if (base.role === 'landing') {
+                 base.accountingUsers = users.map((user) => ({
+                     id: user.id,
+@@ -119,10 +155,10 @@
+             // A failed SIGHUP can leave the new file on disk while the old
+             // generation is still serving. Retry until this process observes
+             // an acknowledged reload, including after the Node adapter restarts.
+-            if (online && (current !== next || this.appliedConfig === null)) {
+-                await this.reload(users.map((user) => user.panelUserId));
+-            }
+-            if (online) this.appliedConfig = next;
++            if (online && (current !== next || this.appliedConfig !== next)) {
++                await this.reload(this.activeIds(base));
++            }
++            this.appliedConfig = online ? next : null;
+             this.inboundTag = inboundTag;
+             this.outboundTag = outboundTag;
+         });
+@@ -147,7 +183,10 @@
+             ) as Record<string, unknown> | undefined;
+             // The panel may replay an AddUser after every status sync. Replaying
+             // an unchanged identity must not reload the live listener.
+-            if (previous?.id === uuid) return false;
++            if (previous?.id === uuid) {
++                await this.retryPendingReload(config);
++                return false;
++            }
+             const retained = users.filter(
+                 (user) =>
+                     user &&
+@@ -167,8 +206,7 @@
+             );
+             config[field] = retained;
+             await this.writeValidated(config);
+-            await this.reload(this.activeIds(config));
+-            this.appliedConfig = JSON.stringify(config);
++            await this.retryPendingReload(config);
+             return true;
+         });
+     }
+@@ -190,10 +228,12 @@
+                     typeof user === 'object' &&
+                     (user as Record<string, unknown>).panelUserId !== panelUserId,
+             );
+-            if ((config[field] as unknown[]).length === existing.length) return;
++            if ((config[field] as unknown[]).length === existing.length) {
++                await this.retryPendingReload(config);
++                return;
++            }
+             await this.writeValidated(config);
+-            await this.reload(this.activeIds(config));
+-            this.appliedConfig = JSON.stringify(config);
++            await this.retryPendingReload(config);
+         });
+     }
+ 
+@@ -253,12 +293,21 @@
+             const next = JSON.stringify(config);
+             const current = await readFile(this.activePath, 'utf8');
+             if (current !== next) await this.writeValidated(config);
+-            if ((current !== next || this.appliedConfig === null) && (await this.isOnline())) {
++            const online = await this.isOnline();
++            if ((current !== next || this.appliedConfig !== next) && online) {
+                 await this.reload(this.activeIds(config));
+             }
+-            if (await this.isOnline()) this.appliedConfig = next;
++            this.appliedConfig = online ? next : null;
+             return changed;
+         });
++    }
++
++    private async retryPendingReload(config: Record<string, unknown>): Promise<void> {
++        const next = JSON.stringify(config);
++        if (this.appliedConfig !== next) {
++            await this.reload(this.activeIds(config));
++            this.appliedConfig = next;
++        }
+     }
+ 
+     public async getUsersStats(
+@@ -443,7 +492,6 @@
+             const snapshot = await this.readSnapshot();
+             const applied =
+                 JSON.stringify(snapshot.activePanelIds) === JSON.stringify(this.activeIds(config));
+-            if (applied && this.appliedConfig === null) this.appliedConfig = JSON.stringify(config);
+             return applied && this.appliedConfig === JSON.stringify(config);
+         } catch {
+             return false;
+--- a/src/modules/xray-core/xray.service.ts
++++ b/src/modules/xray-core/xray.service.ts
+@@ -150,6 +150,14 @@
+                     }
+                     await new Promise((resolve) => setTimeout(resolve, 100));
+                 }
++                // If Rust was offline during the first preparation, the file
++                // was only staged. Require an acknowledged reload now; matching
++                // panel IDs alone cannot prove that the new UUIDs are active.
++                if (online) {
++                    await this.rustCore.prepareFromPanel(
++                        body.xrayConfig as unknown as Record<string, unknown>,
++                    );
++                }
+                 const applied = online && (await this.rustCore.activeConfigApplied());
+                 this.isXrayOnline = applied;
+                 return ok(
+@@ -351,7 +359,8 @@
+                 return ok(
+                     new GetNodeHealthCheckResponseModel(
+                         true,
+-                        await this.rustCore.isOnline(),
++                        (await this.rustCore.isOnline()) &&
++                            (await this.rustCore.activeConfigApplied()),
+                         'rust-reality',
+                         this.nodeVersion,
+                     ),
+--- a/src/modules/handler/handler.service.ts
++++ b/src/modules/handler/handler.service.ts
+@@ -71,14 +71,12 @@
+                     )
+                 )
+                     throw new Error('Rust core accepts VLESS Vision users only');
+-                let changed = false;
+                 if (requestData[0].type === 'vless') {
+-                    changed = await this.rustCore.addVlessUser(
+-                        requestData[0].username,
+-                        requestData[0].uuid,
+-                    );
++                    await this.rustCore.addVlessUser(requestData[0].username, requestData[0].uuid);
+                 }
+-                if (changed) await dropRustUserSessions([requestData[0].username]);
++                // A successful Rust generation publication revokes retired
++                // UUID sessions atomically. A later ID-only control retry could
++                // instead disconnect the newly admitted identity.
+                 return ok(new AddUserResponseModel(true, null));
+             }
+             const response: Array<ISdkResponse<AddUserResponseModelFromSdk>> = [];
+@@ -225,7 +223,6 @@
+             const { username, hashData } = data;
+             if (this.rustCore.enabled) {
+                 await this.rustCore.removeUser(username);
+-                await dropRustUserSessions([username]);
+                 return ok(new RemoveUserResponseModel(true, null));
+             }
+             const response: Array<ISdkResponse<RemoveUserResponseModelFromSdk>> = [];
+@@ -283,7 +280,7 @@
+                     )
+                 )
+                     throw new Error('Rust core accepts VLESS Vision users only');
+-                const changed = await this.rustCore.syncBatchUsers(
++                await this.rustCore.syncBatchUsers(
+                     users.map((user) => ({
+                         username: user.userData.userId,
+                         // The panel sends an empty inbound list to remove an
+@@ -291,8 +288,6 @@
+                         uuid: user.inboundData.length ? user.userData.vlessUuid : undefined,
+                     })),
+                 );
+-                for (let offset = 0; offset < changed.length; offset += 1000)
+-                    await dropRustUserSessions(changed.slice(offset, offset + 1000));
+                 return ok(new AddUserResponseModel(true, null));
+             }
+ 
+@@ -420,11 +415,9 @@
+         const tm = performance.now();
+         try {
+             if (this.rustCore.enabled) {
+-                const changed = await this.rustCore.syncBatchUsers(
++                await this.rustCore.syncBatchUsers(
+                     data.users.map((user) => ({ username: user.userId })),
+                 );
+-                for (let offset = 0; offset < changed.length; offset += 1000)
+-                    await dropRustUserSessions(changed.slice(offset, offset + 1000));
+                 return ok(new RemoveUserResponseModel(true, null));
+             }
+             const inboundTags = this.internalService.getXtlsConfigInbounds();
+--- a/src/modules/stats/stats.service.ts
++++ b/src/modules/stats/stats.service.ts
+@@ -61,7 +61,10 @@
+     public async getSystemStats(): Promise<TResult<GetSystemStatsResponseModel>> {
+         try {
+             if (this.rustCore.enabled) {
+-                if (!(await this.rustCore.isOnline()))
++                if (
++                    !(await this.rustCore.isOnline()) ||
++                    !(await this.rustCore.activeConfigApplied())
++                )
+                     return fail(ERRORS.FAILED_TO_GET_SYSTEM_STATS);
+                 const interfaceStats = await this.queryBus.execute(new GetInterfaceStatsQuery());
+                 const reportsCount = await this.queryBus.execute(
+--- a/tests/rust-core.test.cjs
++++ b/tests/rust-core.test.cjs
+@@ -68,14 +68,18 @@
+         assert.deepEqual(active.users[1].shortIds, []);
+         await service.prepareFromPanel({
+             outbounds: [{ tag: 'DIRECT' }],
+-            inbounds: [{
+-                tag: 'entry', protocol: 'vless',
+-                settings: { clients: [{ email: '5197', id: oldUuid }] },
+-            }],
++            inbounds: [
++                {
++                    tag: 'entry',
++                    protocol: 'vless',
++                    settings: { clients: [{ email: '5197', id: oldUuid }] },
++                },
++            ],
+         });
+         assert.deepEqual(
+-            JSON.parse(await readFile(process.env.RUST_REALITY_ACTIVE_CONFIG, 'utf8'))
+-                .users.map((user) => user.panelUserId),
++            JSON.parse(await readFile(process.env.RUST_REALITY_ACTIVE_CONFIG, 'utf8')).users.map(
++                (user) => user.panelUserId,
++            ),
+             [5197],
+         );
+         service.isOnline = async () => true;
+@@ -92,8 +96,8 @@
+                     protocol: 'vless',
+                     settings: {
+                         clients: [
++                            { email: '10521', id: newUuid, flow: 'xtls-rprx-vision' },
+                             { email: '5197', id: oldUuid, flow: 'xtls-rprx-vision' },
+-                            { email: '10521', id: newUuid, flow: 'xtls-rprx-vision' },
+                         ],
+                     },
+                 },
+@@ -244,8 +248,14 @@
+         service.writeValidated = async (config) =>
+             writeFile(process.env.RUST_REALITY_ACTIVE_CONFIG, JSON.stringify(config));
+         service.reload = async (ids) => acknowledged.push(ids);
+-        assert.equal(await service.addVlessUser('5197', '11111111-1111-4111-8111-111111111111'), true);
+-        assert.equal(await service.addVlessUser('5197', '11111111-1111-4111-8111-111111111111'), false);
++        assert.equal(
++            await service.addVlessUser('5197', '11111111-1111-4111-8111-111111111111'),
++            true,
++        );
++        assert.equal(
++            await service.addVlessUser('5197', '11111111-1111-4111-8111-111111111111'),
++            false,
++        );
+         await service.addVlessUser('10521', '22222222-2222-4222-8222-222222222222');
+         await service.removeUser('5197');
+         await service.removeUser('5197');
+@@ -345,7 +355,10 @@
+     try {
+         const service = new RustCoreService();
+         service.readSnapshot = async () => ({
+-            version: 1, bootId: BOOT, generation: 1, activePanelIds: [5197],
++            version: 1,
++            bootId: BOOT,
++            generation: 1,
++            activePanelIds: [5197],
+             users: [{ label: '5197', uplink: 100, downlink: 200, onlineIps: [] }],
+         });
+         // The controller may produce this response but the panel may never see it.
+@@ -357,9 +370,12 @@
+     } finally {
+         await rm(dir, { recursive: true, force: true });
+         for (const key of [
+-            'RUST_REALITY_BASE_CONFIG', 'RUST_REALITY_ACTIVE_CONFIG',
+-            'RUST_REALITY_MANAGEMENT_SOCKET', 'RUST_REALITY_CURSOR',
+-        ]) delete process.env[key];
++            'RUST_REALITY_BASE_CONFIG',
++            'RUST_REALITY_ACTIVE_CONFIG',
++            'RUST_REALITY_MANAGEMENT_SOCKET',
++            'RUST_REALITY_CURSOR',
++        ])
++            delete process.env[key];
+     }
+ });
+ 
+@@ -374,7 +390,10 @@
+         let bootId = BOOT;
+         let uplink = 100;
+         service.readSnapshot = async () => ({
+-            version: 1, bootId, generation: 1, activePanelIds: [5197],
++            version: 1,
++            bootId,
++            generation: 1,
++            activePanelIds: [5197],
+             users: [{ label: '5197', uplink, downlink: 0, onlineIps: [] }],
+         });
+         assert.equal((await service.getUsersStats(true))[0].uplink, 100);
+@@ -388,8 +407,219 @@
+     } finally {
+         await rm(dir, { recursive: true, force: true });
+         for (const key of [
+-            'RUST_REALITY_BASE_CONFIG', 'RUST_REALITY_ACTIVE_CONFIG',
+-            'RUST_REALITY_MANAGEMENT_SOCKET', 'RUST_REALITY_CURSOR',
+-        ]) delete process.env[key];
+-    }
+-});
++            'RUST_REALITY_BASE_CONFIG',
++            'RUST_REALITY_ACTIVE_CONFIG',
++            'RUST_REALITY_MANAGEMENT_SOCKET',
++            'RUST_REALITY_CURSOR',
++        ])
++            delete process.env[key];
++    }
++});
++
++test('imports advertised panel short IDs when the entry template has none', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'octo-rust-shortids-'));
++    process.env.RUST_REALITY_BASE_CONFIG = join(dir, 'base.json');
++    process.env.RUST_REALITY_ACTIVE_CONFIG = join(dir, 'active.json');
++    process.env.RUST_REALITY_MANAGEMENT_SOCKET = join(dir, 'management.sock');
++    process.env.RUST_REALITY_CURSOR = join(dir, 'cursor.json');
++    const uuid = '11111111-1111-4111-8111-111111111111';
++    const panel = (shortIds) => ({
++        outbounds: [{ tag: 'DIRECT' }],
++        inbounds: [
++            {
++                tag: 'entry',
++                protocol: 'vless',
++                streamSettings: { security: 'reality', realitySettings: { shortIds } },
++                settings: { clients: [{ email: '5197', id: uuid, flow: 'xtls-rprx-vision' }] },
++            },
++        ],
++    });
++    try {
++        await writeFile(
++            process.env.RUST_REALITY_BASE_CONFIG,
++            JSON.stringify({ role: 'entry', reality: {}, users: [] }),
++        );
++        const service = new RustCoreService();
++        service.isOnline = async () => false;
++        service.writeValidated = async (config) =>
++            writeFile(process.env.RUST_REALITY_ACTIVE_CONFIG, JSON.stringify(config));
++        await service.prepareFromPanel(panel(['aabb', '0123456789abcdef']));
++        const active = JSON.parse(await readFile(process.env.RUST_REALITY_ACTIVE_CONFIG, 'utf8'));
++        assert.deepEqual(active.reality.sharedShortIds, ['aabb', '0123456789abcdef']);
++        assert.deepEqual(
++            active.users.map((user) => user.panelUserId),
++            [5197],
++        );
++        assert.deepEqual(
++            JSON.parse(await readFile(process.env.RUST_REALITY_BASE_CONFIG, 'utf8')).reality,
++            {},
++            'operator template is untouched',
++        );
++        await assert.rejects(service.prepareFromPanel(panel([])), /needs panel REALITY short IDs/);
++        await assert.rejects(service.prepareFromPanel(panel(['not-hex'])), /malformed/);
++    } finally {
++        await rm(dir, { recursive: true, force: true });
++        for (const key of [
++            'RUST_REALITY_BASE_CONFIG',
++            'RUST_REALITY_ACTIVE_CONFIG',
++            'RUST_REALITY_MANAGEMENT_SOCKET',
++            'RUST_REALITY_CURSOR',
++        ])
++            delete process.env[key];
++    }
++});
++
++test('dynamic add and remove retry a failed reload even after the file was staged', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'octo-rust-retry-'));
++    process.env.RUST_REALITY_BASE_CONFIG = join(dir, 'base.json');
++    process.env.RUST_REALITY_ACTIVE_CONFIG = join(dir, 'active.json');
++    process.env.RUST_REALITY_MANAGEMENT_SOCKET = join(dir, 'management.sock');
++    process.env.RUST_REALITY_CURSOR = join(dir, 'cursor.json');
++    const uuid = '11111111-1111-4111-8111-111111111111';
++    try {
++        await writeFile(
++            process.env.RUST_REALITY_ACTIVE_CONFIG,
++            JSON.stringify({ role: 'entry', reality: { sharedShortIds: ['aabb'] }, users: [] }),
++        );
++        const service = new RustCoreService();
++        service.writeValidated = async (config) =>
++            writeFile(process.env.RUST_REALITY_ACTIVE_CONFIG, JSON.stringify(config));
++        const reloads = [];
++        service.reload = async (ids) => {
++            reloads.push(ids);
++            if (reloads.length === 1 || reloads.length === 3) throw new Error('SIGHUP failed');
++        };
++        await assert.rejects(service.addVlessUser('5197', uuid), /SIGHUP failed/);
++        assert.equal(
++            await service.addVlessUser('5197', uuid),
++            false,
++            'same staged identity triggers retry',
++        );
++        await assert.rejects(service.removeUser('5197'), /SIGHUP failed/);
++        await service.removeUser('5197');
++        assert.deepEqual(reloads, [[5197], [5197], [], []]);
++    } finally {
++        await rm(dir, { recursive: true, force: true });
++        for (const key of [
++            'RUST_REALITY_BASE_CONFIG',
++            'RUST_REALITY_ACTIVE_CONFIG',
++            'RUST_REALITY_MANAGEMENT_SOCKET',
++            'RUST_REALITY_CURSOR',
++        ])
++            delete process.env[key];
++    }
++});
++
++test('batch retries a staged generation after a reload failure with an older applied config', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'octo-rust-batch-retry-'));
++    process.env.RUST_REALITY_BASE_CONFIG = join(dir, 'base.json');
++    process.env.RUST_REALITY_ACTIVE_CONFIG = join(dir, 'active.json');
++    process.env.RUST_REALITY_MANAGEMENT_SOCKET = join(dir, 'management.sock');
++    process.env.RUST_REALITY_CURSOR = join(dir, 'cursor.json');
++    const uuid1 = '11111111-1111-4111-8111-111111111111';
++    const uuid2 = '22222222-2222-4222-8222-222222222222';
++    try {
++        await writeFile(
++            process.env.RUST_REALITY_ACTIVE_CONFIG,
++            JSON.stringify({ role: 'entry', reality: { sharedShortIds: ['aabb'] }, users: [] }),
++        );
++        const service = new RustCoreService();
++        service.isOnline = async () => true;
++        service.writeValidated = async (config) =>
++            writeFile(process.env.RUST_REALITY_ACTIVE_CONFIG, JSON.stringify(config));
++        const reloads = [];
++        service.reload = async (ids) => {
++            reloads.push(ids);
++            if (reloads.length === 2) throw new Error('SIGHUP failed');
++        };
++        assert.deepEqual(await service.syncBatchUsers([{ username: '5197', uuid: uuid1 }]), [
++            '5197',
++        ]);
++        await assert.rejects(
++            service.syncBatchUsers([{ username: '10521', uuid: uuid2 }]),
++            /SIGHUP failed/,
++        );
++        assert.deepEqual(
++            await service.syncBatchUsers([{ username: '10521', uuid: uuid2 }]),
++            [],
++            'retry has no logical user change',
++        );
++        assert.deepEqual(reloads, [[5197], [5197, 10521], [5197, 10521]]);
++    } finally {
++        await rm(dir, { recursive: true, force: true });
++        for (const key of [
++            'RUST_REALITY_BASE_CONFIG',
++            'RUST_REALITY_ACTIVE_CONFIG',
++            'RUST_REALITY_MANAGEMENT_SOCKET',
++            'RUST_REALITY_CURSOR',
++        ])
++            delete process.env[key];
++    }
++});
++
++test('health requires a reload acknowledgment after an offline-staged config', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'octo-rust-health-proof-'));
++    process.env.RUST_REALITY_BASE_CONFIG = join(dir, 'base.json');
++    process.env.RUST_REALITY_ACTIVE_CONFIG = join(dir, 'active.json');
++    process.env.RUST_REALITY_MANAGEMENT_SOCKET = join(dir, 'management.sock');
++    process.env.RUST_REALITY_CURSOR = join(dir, 'cursor.json');
++    const panel = {
++        outbounds: [{ tag: 'DIRECT' }],
++        inbounds: [
++            {
++                tag: 'entry',
++                protocol: 'vless',
++                settings: {
++                    clients: [
++                        {
++                            email: '5197',
++                            id: '11111111-1111-4111-8111-111111111111',
++                            flow: 'xtls-rprx-vision',
++                        },
++                    ],
++                },
++            },
++        ],
++    };
++    try {
++        await writeFile(
++            process.env.RUST_REALITY_BASE_CONFIG,
++            JSON.stringify({ role: 'entry', reality: { sharedShortIds: ['aabb'] }, users: [] }),
++        );
++        const service = new RustCoreService();
++        service.writeValidated = async (config) =>
++            writeFile(process.env.RUST_REALITY_ACTIVE_CONFIG, JSON.stringify(config));
++        service.readSnapshot = async () => ({
++            version: 1,
++            bootId: BOOT,
++            generation: 1,
++            activePanelIds: [5197],
++            users: [],
++        });
++        service.isOnline = async () => false;
++        await service.prepareFromPanel(panel);
++        assert.equal(
++            await service.activeConfigApplied(),
++            false,
++            'identical IDs do not prove an offline-staged UUID was loaded',
++        );
++        service.isOnline = async () => true;
++        let reloads = 0;
++        service.reload = async (ids) => {
++            assert.deepEqual(ids, [5197]);
++            reloads++;
++        };
++        await service.prepareFromPanel(panel);
++        assert.equal(reloads, 1);
++        assert.equal(await service.activeConfigApplied(), true);
++    } finally {
++        await rm(dir, { recursive: true, force: true });
++        for (const key of [
++            'RUST_REALITY_BASE_CONFIG',
++            'RUST_REALITY_ACTIVE_CONFIG',
++            'RUST_REALITY_MANAGEMENT_SOCKET',
++            'RUST_REALITY_CURSOR',
++        ])
++            delete process.env[key];
++    }
++});

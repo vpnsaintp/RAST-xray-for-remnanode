@@ -6,3 +6,7 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.sh text eol=lf
+
+# Preserve the reviewed RemnaNode patch byte for byte; it contains context
+# lines whose whitespace is part of the patch payload.
+integrations/remnanode/*.patch -text whitespace=-blank-at-eol

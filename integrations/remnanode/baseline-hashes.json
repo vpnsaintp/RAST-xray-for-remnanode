@@ -1,0 +1,31 @@
+{
+  "nodeVersion": "3.4.1",
+  "upstream": "https://github.com/remnawave/node",
+  "files": [
+    {
+      "path": "src/modules/rust-core/rust-core.service.ts",
+      "baseline_sha256": "0f7678f25baef63d8e3e230ecbbcf9529ec37e349e09ecd85c0b4c8aceaef037",
+      "modified_sha256": "bd855c081d3909d20049d4ccb4f7a96ee461ea1eeee5b268fb0ce9482bad607e"
+    },
+    {
+      "path": "src/modules/xray-core/xray.service.ts",
+      "baseline_sha256": "6f987afaa7e8aff80f6fed2aa1a02fd0b3175a271bf0a048f19ec7c3a83a03a0",
+      "modified_sha256": "9c63df3e25ccac391a1fbb8fff84f904a313798bf1e851e8c7c6d0dc9472636b"
+    },
+    {
+      "path": "src/modules/handler/handler.service.ts",
+      "baseline_sha256": "389c70ffe5b43e6f88e7ec8ebe95a92357bdfaedbac26c9dc3fef3244f6d58fd",
+      "modified_sha256": "15b9a6faf76caf304754bf64ca0c276fb7cbe32e11c05ae8c52fbe52765102fa"
+    },
+    {
+      "path": "src/modules/stats/stats.service.ts",
+      "baseline_sha256": "f64266c7aa73849e4e813c9bdd74e5d4d8e434ce8d592d03e4b233e2074a687c",
+      "modified_sha256": "7075a1cd39be4f990dfb02049e5e743ac5bfaef9a36cd847d0a13f8ab3692e27"
+    },
+    {
+      "path": "tests/rust-core.test.cjs",
+      "baseline_sha256": "9180e7d51a50f43fe2ee39d33edfe1765c4a80411a84724fc3213250599557ad",
+      "modified_sha256": "29765582dda8eb99b6cdcaff3a303c818e4b27fcf400a09507e01f01f3a364c6"
+    }
+  ]
+}

@@ -312,6 +312,13 @@ fn parses_server_spec_forms() {
             server_name: "dns.google".to_owned(),
         })
     );
+    assert_eq!(
+        parse_server_spec("tls://dns.google/[2001:4860:4860::8888]"),
+        Ok(DnsServerSpec::Tls {
+            address: SocketAddr::new("2001:4860:4860::8888".parse().expect("v6 literal"), 853),
+            server_name: "dns.google".to_owned(),
+        })
+    );
     for invalid in [
         "tls://dns.google",
         "tls://bad_name/8.8.8.8",

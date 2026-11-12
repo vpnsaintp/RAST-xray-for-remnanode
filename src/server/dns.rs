@@ -239,7 +239,7 @@ fn system_lookup(name: &str) -> Result<UpstreamAnswer, UpstreamError> {
     Ok(UpstreamAnswer { ips, ttl: None })
 }
 
-/// Real DNS over plain UDP with TCP fallback, observing upstream TTLs.
+/// Real DNS over configured plain UDP/TCP or TLS peers, observing upstream TTLs.
 struct HickoryBackend {
     resolver: TokioResolver,
 }

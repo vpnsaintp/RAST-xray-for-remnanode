@@ -75,6 +75,10 @@ const ROOT_ENTRIES: &[RootEntry] = &[
         role: "Chinese project entrypoint",
     },
     RootEntry {
+        name: "REVIEW.md",
+        role: "source-review snapshot provenance and unverified gates",
+    },
+    RootEntry {
         name: "SECURITY.md",
         role: "security reporting and support policy",
     },
@@ -109,6 +113,10 @@ const ROOT_ENTRIES: &[RootEntry] = &[
     RootEntry {
         name: "fuzz",
         role: "production attack-surface fuzz workspace",
+    },
+    RootEntry {
+        name: "integrations",
+        role: "independently licensed external runtime adapter sources and provenance",
     },
     RootEntry {
         name: "rust-toolchain.toml",
@@ -209,7 +217,11 @@ const REQUIRED_PATHS: &[&str] = &[
 ];
 
 /// Exact colocated Markdown owners outside `docs/` and the standard root docs.
-const COLOCATED_MARKDOWN: &[&str] = &["benchmarks/README.md", "tools/reference/README.md"];
+const COLOCATED_MARKDOWN: &[&str] = &[
+    "benchmarks/README.md",
+    "integrations/remnanode/README.md",
+    "tools/reference/README.md",
+];
 
 /// The only machine-data homes below `benchmarks/`.
 const BENCHMARK_DIRECTORIES: &[&str] = &[
@@ -366,6 +378,7 @@ fn is_owned_markdown(path: &str) -> bool {
             "CONTRIBUTING.md",
             "README.md",
             "README.zh-CN.md",
+            "REVIEW.md",
             "SECURITY.md",
         ]
         .contains(&path);

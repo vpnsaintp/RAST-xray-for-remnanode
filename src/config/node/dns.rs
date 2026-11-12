@@ -2,7 +2,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 /// Resolvers and the shared resolution cache.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
@@ -72,7 +72,17 @@ pub(crate) fn parse_dot_server_spec(spec: &str) -> Result<Option<DotServerSpec<'
     if endpoint.is_empty() || endpoint.contains('/') {
         return Err("DNS-over-TLS endpoint must be a numeric IP address and optional port");
     }
-    let address = if let Ok(ip) = endpoint.parse::<IpAddr>() {
+    let address = if let Some(ipv6) = endpoint
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        SocketAddr::new(
+            ipv6.parse::<Ipv6Addr>()
+                .map_err(|_| "invalid DNS-over-TLS IPv6 address")?
+                .into(),
+            853,
+        )
+    } else if let Ok(ip) = endpoint.parse::<IpAddr>() {
         SocketAddr::new(ip, 853)
     } else {
         endpoint

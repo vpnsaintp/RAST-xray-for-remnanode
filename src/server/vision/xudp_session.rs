@@ -110,11 +110,18 @@ impl VisionHandler {
         } else {
             route.resolved_ips()
         };
-        let resolved = if let Some(ip) = preferred_udp_egress_ip(
-            capability,
-            resolved_ips,
-            crate::server::xudp::udp_route_available,
-        ) {
+        let preferred = if capability == XudpEgressCapability::Direct
+            && self.outbounds.direct_source_ip().is_some()
+        {
+            resolved_ips.iter().copied().find(IpAddr::is_ipv4)
+        } else {
+            preferred_udp_egress_ip(
+                capability,
+                resolved_ips,
+                crate::server::xudp::udp_route_available,
+            )
+        };
+        let resolved = if let Some(ip) = preferred {
             match ip {
                 IpAddr::V4(v4) => crate::protocol::vless::Destination::new(
                     crate::protocol::vless::Address::Ipv4(v4),
@@ -242,17 +249,31 @@ impl VisionHandler {
                                 require_direct_xudp_landward(capability).map_err(|error| {
                                     VisionSessionError::Xudp(XudpSessionError::Outbound(error))
                                 })?;
-                                XudpLandwardAssociation::Direct(
+                                let direct = if let Some(ip) = self.outbounds.direct_source_ip() {
+                                    XudpDirectAssociation::open_with_required_source(
+                                        &bind_dest,
+                                        packet.global_id,
+                                        *user_id.as_bytes(),
+                                        globals,
+                                        self.relay.fd_budget().clone(),
+                                        now,
+                                        IpAddr::V4(ip),
+                                    )
+                                    .await
+                                } else {
                                     XudpDirectAssociation::open(
                                         &bind_dest,
                                         packet.global_id,
                                         *user_id.as_bytes(),
                                         globals,
+                                        self.relay.fd_budget().clone(),
                                         now,
                                         None,
                                     )
                                     .await
-                                    .map_err(VisionSessionError::Xudp)?,
+                                };
+                                XudpLandwardAssociation::Direct(
+                                    direct.map_err(VisionSessionError::Xudp)?,
                                 )
                             }
                             XudpEgressCapability::Nxr => {

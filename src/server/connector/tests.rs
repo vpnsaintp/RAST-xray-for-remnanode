@@ -159,6 +159,7 @@ async fn connects_to_numeric_ipv6_destination_without_dns() {
         Duration::from_secs(1),
         NetworkConfig {
             ip: Some(DialPolicy::Ipv6Only),
+            direct_source_ip: None,
         },
         NetworkEnvironment::with_routes_and_primary(
             DialPolicy::Ipv6Only,
@@ -173,6 +174,37 @@ async fn connects_to_numeric_ipv6_destination_without_dns() {
         .expect("numeric IPv6 destination should connect");
     let (_accepted, peer) = listener.accept().await.expect("accept IPv6 client");
     assert_eq!(stream.local_addr().expect("read local address"), peer);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_tcp_uses_required_source_ipv4() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind IPv4 listener");
+    let destination = Destination::new(
+        Address::Ipv4(Ipv4Addr::LOCALHOST),
+        listener.local_addr().expect("listener address").port(),
+    );
+    let source = Ipv4Addr::new(127, 0, 0, 2);
+    let connector = DestinationConnector::new(Duration::from_secs(1)).with_source_ip(Some(source));
+    let stream = connector
+        .connect(&destination)
+        .await
+        .expect("direct connect");
+    let (_accepted, peer) = listener.accept().await.expect("accept direct connect");
+    assert_eq!(
+        stream.local_addr().expect("client local address").ip(),
+        source
+    );
+    assert_eq!(peer.ip(), std::net::IpAddr::V4(source));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_tcp_does_not_fall_back_to_ipv6_when_source_is_ipv4() {
+    let destination = Destination::new(Address::Ipv6(Ipv6Addr::LOCALHOST), 1);
+    let connector = DestinationConnector::new(Duration::from_secs(1))
+        .with_source_ip(Some(Ipv4Addr::new(127, 0, 0, 2)));
+    assert!(connector.connect(&destination).await.is_err());
 }
 
 fn test_planner(mode: DialPolicy, delay_ms: u64) -> ConnectionPlanner {

@@ -246,7 +246,7 @@ fn validate_client(client: &ClientConfig) -> Result<(), SemanticError> {
             );
         }
     }
-    validate_dns(client.dns.as_ref())?;
+    validate_dns(client.dns.as_ref(), false)?;
     validate_log(client.log.as_ref())?;
     validate_runtime(client.runtime.as_ref())?;
     Ok(())
@@ -334,7 +334,13 @@ fn validate_entry(entry: &EntryConfig) -> Result<(), SemanticError> {
     validate_users(entry)?;
     validate_routing(&entry.routing, &outbounds)?;
     validate_assets(entry)?;
-    validate_dns(entry.dns.as_ref())?;
+    validate_dns(
+        entry.dns.as_ref(),
+        entry
+            .network
+            .as_ref()
+            .is_some_and(|network| network.direct_source_ip.is_some()),
+    )?;
     validate_log(entry.log.as_ref())?;
     validate_runtime(entry.runtime.as_ref())?;
     validate_key_independence(entry_key_material(entry))
@@ -593,7 +599,13 @@ fn validate_landing(landing: &LandingConfig) -> Result<(), SemanticError> {
     let outbounds = validate_outbounds(landing.outbounds.as_ref())?;
     validate_landing_protocol(&landing.landing)?;
     validate_egress(landing, &outbounds)?;
-    validate_dns(landing.dns.as_ref())?;
+    validate_dns(
+        landing.dns.as_ref(),
+        landing
+            .network
+            .as_ref()
+            .is_some_and(|network| network.direct_source_ip.is_some()),
+    )?;
     validate_log(landing.log.as_ref())?;
     validate_runtime(landing.runtime.as_ref())?;
     validate_key_independence(landing_key_material(landing))
@@ -857,7 +869,29 @@ fn validate_outbound(path: &str, outbound: &OutboundConfig) -> Result<(), Semant
     Ok(())
 }
 
-fn validate_dns(dns: Option<&DnsConfig>) -> Result<(), SemanticError> {
+fn validate_dns(dns: Option<&DnsConfig>, direct_source_ip: bool) -> Result<(), SemanticError> {
+    // The runtime binds every upstream DNS socket to directSourceIp. Validate
+    // the same source-independent constraint here so `check` cannot approve a
+    // configuration that `serve` immediately rejects at bootstrap.
+    if direct_source_ip {
+        let default_dns = DnsConfig::default();
+        for (index, server) in dns.unwrap_or(&default_dns).servers().iter().enumerate() {
+            let server = server.trim();
+            if server.parse::<std::net::Ipv4Addr>().is_err()
+                && server.parse::<std::net::SocketAddrV4>().is_err()
+            {
+                let path = if dns.and_then(|config| config.servers.as_ref()).is_some() {
+                    format!("dns.servers[{index}]")
+                } else {
+                    "network.directSourceIp".to_owned()
+                };
+                return fail(
+                    path,
+                    "directSourceIp requires dns.servers containing only numeric IPv4 addresses or IPv4:port endpoints",
+                );
+            }
+        }
+    }
     let Some(dns) = dns else { return Ok(()) };
     if let Some(servers) = &dns.servers {
         if servers.is_empty() {

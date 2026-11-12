@@ -601,8 +601,9 @@ pub enum LogEvent {
         panel_user_id: u64,
     },
     /// First decrypted TCP application bytes matched a protocol signature.
-    /// This event is emitted only for an authenticated panel user whose source
-    /// address came from a successfully parsed, loopback-only PROXY v1 header.
+    /// This event is emitted only for an authenticated panel user. The source
+    /// is either a verified loopback-only PROXY v1 header or the TCP peer
+    /// observed by the kernel; the attribution field distinguishes them.
     /// No application bytes, peer ID, or torrent info hash are retained.
     ProtocolDetected {
         entry: String,

@@ -5,7 +5,7 @@
 //! lives beside the replay/keys/error surfaces. The sealed policy snapshot
 //! codec lives in [`policy`] and the bounds-checked reader in [`cursor`].
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 mod cursor;
 mod policy;
@@ -16,8 +16,8 @@ use policy::{decode_policy_snapshot, encode_policy_snapshot, encoded_policy_len}
 use super::policy::SessionKind;
 use super::{
     ADDRESS_DOMAIN, ADDRESS_IPV4, ADDRESS_IPV6, CONTINUATION_STATE_VERSION, ContinuationState,
-    HandoffError, MAX_BLOB_LEN, MAX_DOMAIN_LEN, MAX_INBOUND_TAG_LEN, MAX_PENDING_CIPHERTEXT_LEN,
-    MAX_PREFETCHED_PLAINTEXT_LEN, USER_ID_LEN,
+    HandoffError, IngressSource, MAX_BLOB_LEN, MAX_DOMAIN_LEN, MAX_INBOUND_TAG_LEN,
+    MAX_PENDING_CIPHERTEXT_LEN, MAX_PREFETCHED_PLAINTEXT_LEN, USER_ID_LEN,
 };
 use crate::protocol::reality::tls13::{CipherSuite, TrafficSecret};
 use crate::protocol::vless::{Address, Destination};
@@ -37,6 +37,7 @@ pub(crate) fn encode_blob(
         .and_then(|length| length.checked_add(1)) // session_kind
         .and_then(|length| length.checked_add(USER_ID_LEN))
         .and_then(|length| length.checked_add(1 + inbound_len)) // inbound tag
+        .and_then(|length| length.checked_add(1 + source_len(state.ingress_source())))
         .and_then(|length| length.checked_add(1 + 2 + address_length + 2))
         .and_then(|length| length.checked_add(4 + state.pending_ciphertext().len()))
         .and_then(|length| length.checked_add(4 + state.prefetched_plaintext().len()))
@@ -57,12 +58,43 @@ pub(crate) fn encode_blob(
     output.push(state.session_kind().wire());
     output.extend_from_slice(state.user_id());
     encode_short_bytes(state.inbound_tag().as_bytes(), output)?;
+    encode_source(state.ingress_source(), output);
     encode_address(state.destination(), output);
     output.extend_from_slice(&state.destination().port().to_be_bytes());
     encode_bounded_bytes(state.pending_ciphertext(), output);
     encode_bounded_bytes(state.prefetched_plaintext(), output);
     encode_policy_snapshot(state.policy(), output)?;
     Ok(())
+}
+
+fn source_len(source: Option<IngressSource>) -> usize {
+    match source.map(IngressSource::ip) {
+        None => 0,
+        Some(IpAddr::V4(_)) => 4,
+        Some(IpAddr::V6(_)) => 16,
+    }
+}
+
+fn encode_source(source: Option<IngressSource>, output: &mut Vec<u8>) {
+    match source {
+        None => output.push(0),
+        Some(IngressSource::ProxyV1Verified(IpAddr::V4(ip))) => {
+            output.push(1);
+            output.extend_from_slice(&ip.octets());
+        }
+        Some(IngressSource::ProxyV1Verified(IpAddr::V6(ip))) => {
+            output.push(2);
+            output.extend_from_slice(&ip.octets());
+        }
+        Some(IngressSource::TcpPeerObserved(IpAddr::V4(ip))) => {
+            output.push(3);
+            output.extend_from_slice(&ip.octets());
+        }
+        Some(IngressSource::TcpPeerObserved(IpAddr::V6(ip))) => {
+            output.push(4);
+            output.extend_from_slice(&ip.octets());
+        }
+    }
 }
 
 fn encode_short_bytes(bytes: &[u8], output: &mut Vec<u8>) -> Result<(), HandoffError> {
@@ -109,8 +141,8 @@ fn encode_bounded_bytes(bytes: &[u8], output: &mut Vec<u8>) {
 pub(crate) fn decode_blob(blob: &[u8]) -> Result<ContinuationState, HandoffError> {
     let mut cursor = BlobCursor::new(blob);
     let version = cursor.u8()?;
-    // Reject legacy blobs explicitly: never reinterpret v1/v2 as v3 fields.
-    if version != CONTINUATION_STATE_VERSION {
+    // v3 remains readable for LANDING-first rolling upgrades; it has no source proof.
+    if version != CONTINUATION_STATE_VERSION && version != 3 {
         return Err(HandoffError::State);
     }
     let suite = CipherSuite::from_wire(cursor.u16()?).ok_or(HandoffError::State)?;
@@ -129,6 +161,11 @@ pub(crate) fn decode_blob(blob: &[u8]) -> Result<ContinuationState, HandoffError
         .try_into()
         .map_err(|_| HandoffError::State)?;
     let inbound_tag = decode_short_string(&mut cursor)?;
+    let ingress_source = if version == 3 {
+        None
+    } else {
+        decode_source(&mut cursor)?
+    };
     let destination = decode_destination(&mut cursor)?;
     let pending_ciphertext = decode_bounded_bytes(&mut cursor, MAX_PENDING_CIPHERTEXT_LEN)?;
     let prefetched_plaintext = decode_bounded_bytes(&mut cursor, MAX_PREFETCHED_PLAINTEXT_LEN)?;
@@ -136,7 +173,7 @@ pub(crate) fn decode_blob(blob: &[u8]) -> Result<ContinuationState, HandoffError
     if cursor.remaining() != 0 {
         return Err(HandoffError::State);
     }
-    ContinuationState::new(
+    Ok(ContinuationState::new(
         suite,
         client_traffic_secret,
         client_sequence,
@@ -150,7 +187,35 @@ pub(crate) fn decode_blob(blob: &[u8]) -> Result<ContinuationState, HandoffError
         pending_ciphertext,
         prefetched_plaintext,
         policy,
-    )
+    )?
+    .with_optional_ingress_source(ingress_source))
+}
+
+fn decode_source(cursor: &mut BlobCursor<'_>) -> Result<Option<IngressSource>, HandoffError> {
+    let kind = cursor.u8()?;
+    let ip = match kind {
+        0 => return Ok(None),
+        1 | 3 => {
+            let octets: [u8; 4] = cursor
+                .take(4)?
+                .try_into()
+                .map_err(|_| HandoffError::State)?;
+            IpAddr::V4(Ipv4Addr::from(octets))
+        }
+        2 | 4 => {
+            let octets: [u8; 16] = cursor
+                .take(16)?
+                .try_into()
+                .map_err(|_| HandoffError::State)?;
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+        _ => return Err(HandoffError::State),
+    };
+    Ok(Some(if kind <= 2 {
+        IngressSource::ProxyV1Verified(ip)
+    } else {
+        IngressSource::TcpPeerObserved(ip)
+    }))
 }
 
 fn decode_short_string(cursor: &mut BlobCursor<'_>) -> Result<String, HandoffError> {

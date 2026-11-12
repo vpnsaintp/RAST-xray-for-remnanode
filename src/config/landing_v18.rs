@@ -100,6 +100,7 @@ impl LandingV18 {
             log: self.log,
             network: Some(NetworkConfig {
                 ip: self.network.dial.mode,
+                direct_source_ip: None,
             }),
             runtime: Some(RuntimeConfig {
                 profile: self.runtime.profile,

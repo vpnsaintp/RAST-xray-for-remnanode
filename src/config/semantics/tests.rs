@@ -556,6 +556,35 @@ fn the_system_resolver_cannot_be_mixed_with_others() {
 }
 
 #[test]
+fn direct_source_ip_requires_numeric_ipv4_dns_before_serve() {
+    let source = r#","network":{"directSourceIp":"192.0.2.9"}"#;
+    for config in [entry_json(source), landing_json(source)] {
+        let error = reject(&config);
+        assert_eq!(error.path(), "network.directSourceIp");
+        assert!(error.message().contains("numeric IPv4"), "{error}");
+    }
+
+    for servers in [
+        r#"["system"]"#,
+        r#"["resolver.example"]"#,
+        r#"["[2001:db8::1]:53"]"#,
+    ] {
+        let body =
+            format!(r#","network":{{"directSourceIp":"192.0.2.9"}},"dns":{{"servers":{servers}}}"#);
+        for config in [entry_json(&body), landing_json(&body)] {
+            let error = reject(&config);
+            assert_eq!(error.path(), "dns.servers[0]");
+            assert!(error.message().contains("numeric IPv4"), "{error}");
+        }
+    }
+
+    let valid =
+        r#","network":{"directSourceIp":"192.0.2.9"},"dns":{"servers":["1.1.1.1","9.9.9.9:53"]}"#;
+    accept(&entry_json(valid));
+    accept(&landing_json(valid));
+}
+
+#[test]
 fn dns_cache_bounds_must_be_ordered() {
     let error = reject(&entry_json(
         r#","dns":{"cache":{"minTtlSeconds":100,"maxTtlSeconds":50}}"#,

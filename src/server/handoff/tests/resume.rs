@@ -135,8 +135,19 @@ async fn sealed_v3_resume_preserves_generations_buffers_response_and_future_upda
         let state = open_transfer(&message, &handler.keys, &handler.replay, timestamp, 30)
             .expect("authenticated v3 transfer")
             .into_state();
-        let (exported, user, destination, pending, prefetched, response_pending, kind, tag, policy) =
-            state.into_parts().expect("move transferred state");
+        let (
+            exported,
+            user,
+            destination,
+            pending,
+            prefetched,
+            response_pending,
+            kind,
+            tag,
+            policy,
+            source,
+        ) = state.into_parts().expect("move transferred state");
+        assert!(source.is_none());
         assert_eq!(user, *USER.as_bytes());
         assert_eq!(destination.port(), 443);
         assert_eq!(prefetched, b"prefetched Vision bytes");

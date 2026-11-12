@@ -22,6 +22,7 @@ use crate::transport::TcpRelay;
 
 use super::VisionClientHalves;
 use super::abort::SocketAbortGuard;
+use super::bittorrent_monitor::BitTorrentMonitor;
 use super::error::VisionSessionError;
 use super::relay::{SessionContext, join_directions};
 use super::relay_downlink::relay_downlink;
@@ -67,6 +68,7 @@ pub(crate) async fn run_resumed_session(
     prefetched_plaintext: Vec<u8>,
     relay: &TcpRelay,
     timeout: Duration,
+    protocol_monitor: Option<BitTorrentMonitor<'_>>,
 ) -> Result<VisionRelayStats, VisionSessionError> {
     let VisionClientHalves {
         reader: client_reader,
@@ -92,7 +94,7 @@ pub(crate) async fn run_resumed_session(
         prefetched_plaintext,
         prefetched,
         &context,
-        None,
+        protocol_monitor,
     );
     let downlink = relay_downlink(
         destination_reader,

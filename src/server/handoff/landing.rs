@@ -25,6 +25,7 @@ use crate::{
         SecretString,
         node::landing::{HandoffLandingConfig, LandingAccountingUser},
     },
+    logging::Logger,
     network::NetworkEnvironment,
     protocol::{
         handoff::{
@@ -77,6 +78,7 @@ pub struct HandoffLandingHandler {
     udp_mtu: Option<u16>,
     accounting: Option<(UsageLedger, Arc<HashMap<UserId, String>>)>,
     revoker: Option<crate::revocation::SessionRevoker>,
+    access_log: Option<Logger>,
 }
 
 /// A validated outbound the landing dials transferred destinations through.
@@ -198,6 +200,11 @@ impl HandoffLandingHandler {
         Ok(self)
     }
 
+    pub(crate) fn with_access_log(mut self, logger: Logger) -> Self {
+        self.access_log = Some(logger);
+        self
+    }
+
     pub(crate) fn with_revocation(mut self, revoker: crate::revocation::SessionRevoker) -> Self {
         self.revoker = Some(revoker);
         self
@@ -236,6 +243,7 @@ impl HandoffLandingHandler {
             udp_mtu: None,
             accounting: None,
             revoker: None,
+            access_log: None,
         }
     }
 
@@ -313,6 +321,7 @@ impl HandoffLandingHandler {
             session_kind,
             _inbound_tag,
             policy,
+            ingress_source,
         ) = state.into_parts().map_err(HandoffLandingError::Protocol)?;
         let tls = resume_tls(exported_tls)?;
         let user_id = UserId::new(user_id);
@@ -361,7 +370,7 @@ impl HandoffLandingHandler {
             let _ = policy;
             let _fd_permit;
             let _egress_permit;
-            let destination = match &self.egress {
+            let destination_stream = match &self.egress {
                 Some(egress) => match egress.registry.connect(&egress.tag, &destination).await {
                     Ok(OutboundConnectOutcome::Connected(connection)) => {
                         let (stream, permit) = connection.into_parts();
@@ -398,14 +407,35 @@ impl HandoffLandingHandler {
                 tls,
                 key_update_response_pending,
             );
+            // Only LINE's observed source inside the authenticated transfer
+            // may identify a client. The LANDING TCP peer is the bridge itself.
+            let protocol_monitor = self
+                .access_log
+                .as_ref()
+                .zip(self.accounting.as_ref())
+                .zip(ingress_source)
+                .and_then(|((logger, (_, labels)), source)| {
+                    let panel_id = labels.get(&user_id)?.parse::<u64>().ok()?;
+                    (panel_id > 0).then(|| {
+                        super::super::vision::bittorrent_monitor::BitTorrentMonitor::new(
+                            logger,
+                            source.ip(),
+                            source.attribution(),
+                            panel_id,
+                            &_inbound_tag,
+                            &destination,
+                        )
+                    })
+                });
             let stats = run_resumed_session(
                 VisionClientHalves::new(client_reader, client_writer),
-                destination,
+                destination_stream,
                 user_id,
                 usage,
                 prefetched,
                 &self.relay,
                 self.io_timeout,
+                protocol_monitor,
             )
             .await
             .map_err(HandoffLandingError::Session)?;

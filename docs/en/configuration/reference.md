@@ -319,6 +319,10 @@ Cold. The resolver is installed once for the process.
 Exactly `["system"]` uses the operating system resolver through
 `getaddrinfo`, honouring `/etc/resolv.conf`. `"system"` may not be mixed with
 other entries.
+When `network.directSourceIp` is set, `servers` is required and every entry
+must be a numeric IPv4 address, optionally followed by a port. The system
+resolver, hostname servers, and IPv6 servers cannot guarantee that DNS queries
+use the pinned source address; `check` rejects those combinations.
 
 ### DnsCache
 
@@ -344,6 +348,10 @@ Cold. Outbound address-family policy, independent of `listeners[].ip`.
 | field | type | absent means |
 | --- | --- | --- |
 | `ip` | `"auto"` \| `"preferIpv4"` \| `"preferIpv6"` \| `"ipv4Only"` \| `"ipv6Only"` | `"auto"` |
+| `directSourceIp` | IPv4 address | no source pin |
+
+`directSourceIp` binds direct user traffic and upstream DNS to this source IP;
+peer connections and REALITY cover traffic are unaffected.
 
 ## Log
 

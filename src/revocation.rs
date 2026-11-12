@@ -232,4 +232,33 @@ mod tests {
         );
         assert!(registry.register(user, 30).is_none());
     }
+
+    #[tokio::test]
+    async fn rotate_and_remove_cancel_old_sessions_without_dropping_reused_panel_id() {
+        let registry = SessionRevoker::default();
+        let old = UserId::new([4; 16]);
+        let new = UserId::new([5; 16]);
+        registry.publish_identities([(old, 40)].into_iter().collect());
+        let mut retired = registry.register(old, 40).unwrap();
+
+        registry.publish_identities([(new, 40)].into_iter().collect());
+        tokio::time::timeout(std::time::Duration::from_millis(50), retired.cancelled())
+            .await
+            .expect("rotated identity's live session must be revoked");
+        assert!(registry.register(old, 40).is_none());
+
+        let mut current = registry.register(new, 40).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), current.cancelled())
+                .await
+                .is_err(),
+            "new session using the same panel ID must remain live"
+        );
+
+        registry.publish_identities(HashMap::new());
+        tokio::time::timeout(std::time::Duration::from_millis(50), current.cancelled())
+            .await
+            .expect("removing the identity must revoke its active session");
+        assert!(registry.register(new, 40).is_none());
+    }
 }

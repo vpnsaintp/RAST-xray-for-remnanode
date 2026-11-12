@@ -4,7 +4,10 @@
 //! construction while callers keep importing these types from
 //! `protocol::handoff`.
 
-use std::{fmt, net::Ipv4Addr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -17,6 +20,29 @@ use crate::protocol::reality::tls13::{
     CipherSuite, ExportedRecordState, ExportedTlsState, TrafficSecret,
 };
 use crate::protocol::vless::{Address, Destination};
+
+/// Origin observed at the LINE listener, never supplied by the VLESS client.
+/// The whole continuation is authenticated by the pair PSK and LANDING key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressSource {
+    ProxyV1Verified(IpAddr),
+    TcpPeerObserved(IpAddr),
+}
+
+impl IngressSource {
+    pub const fn ip(self) -> IpAddr {
+        match self {
+            Self::ProxyV1Verified(ip) | Self::TcpPeerObserved(ip) => ip,
+        }
+    }
+
+    pub const fn attribution(self) -> &'static str {
+        match self {
+            Self::ProxyV1Verified(_) => "proxy_v1_verified",
+            Self::TcpPeerObserved(_) => "tcp_peer_observed",
+        }
+    }
+}
 
 /// The full surviving session state carried inside the sealed blob.
 ///
@@ -43,6 +69,8 @@ pub struct ContinuationState {
     #[zeroize(skip)]
     inbound_tag: String,
     #[zeroize(skip)]
+    ingress_source: Option<IngressSource>,
+    #[zeroize(skip)]
     destination: Destination,
     pending_ciphertext: Vec<u8>,
     prefetched_plaintext: Vec<u8>,
@@ -61,6 +89,7 @@ pub type ContinuationParts = (
     SessionKind,
     String,
     HandoffPolicySnapshot,
+    Option<IngressSource>,
 );
 
 impl ContinuationState {
@@ -111,11 +140,30 @@ impl ContinuationState {
             session_kind,
             user_id,
             inbound_tag,
+            ingress_source: None,
             destination,
             pending_ciphertext,
             prefetched_plaintext,
             policy,
         })
+    }
+
+    /// Adds only the source observed by the authenticated LINE listener.
+    /// Call before sealing the transfer; a LANDING cannot infer the client IP
+    /// from its peer socket because that socket belongs to LINE.
+    pub fn with_ingress_source(mut self, source: IngressSource) -> Self {
+        self.ingress_source = Some(source);
+        self
+    }
+
+    pub(crate) fn with_optional_ingress_source(mut self, source: Option<IngressSource>) -> Self {
+        self.ingress_source = source;
+        self
+    }
+
+    #[must_use]
+    pub const fn ingress_source(&self) -> Option<IngressSource> {
+        self.ingress_source
     }
 
     /// Returns the negotiated cipher suite.
@@ -244,6 +292,7 @@ impl ContinuationState {
             self.session_kind,
             inbound_tag,
             policy,
+            self.ingress_source,
         ))
     }
 }

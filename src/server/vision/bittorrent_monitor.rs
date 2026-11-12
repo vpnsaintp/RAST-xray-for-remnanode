@@ -11,9 +11,10 @@ use crate::protocol::vless::{Address, Destination};
 
 use super::bittorrent_sniff::{BitTorrentSniffer, Verdict};
 
-pub(super) struct BitTorrentMonitor<'session> {
+pub(crate) struct BitTorrentMonitor<'session> {
     logger: &'session Logger,
     source_ip: IpAddr,
+    source_attribution: &'static str,
     panel_user_id: u64,
     entry: &'session str,
     destination: &'session Destination,
@@ -22,9 +23,10 @@ pub(super) struct BitTorrentMonitor<'session> {
 }
 
 impl<'session> BitTorrentMonitor<'session> {
-    pub(super) fn new(
+    pub(crate) fn new(
         logger: &'session Logger,
         source_ip: IpAddr,
+        source_attribution: &'static str,
         panel_user_id: u64,
         entry: &'session str,
         destination: &'session Destination,
@@ -32,6 +34,7 @@ impl<'session> BitTorrentMonitor<'session> {
         Self {
             logger,
             source_ip,
+            source_attribution,
             panel_user_id,
             entry,
             destination,
@@ -58,7 +61,7 @@ impl<'session> BitTorrentMonitor<'session> {
                     entry: self.entry.to_owned(),
                     panel_user_id: self.panel_user_id,
                     source_ip: self.source_ip,
-                    source_attribution: "proxy_v1_verified",
+                    source_attribution: self.source_attribution,
                     network: "tcp",
                     destination: format!("{address}:{}", self.destination.port()),
                     protocol: "bittorrent",

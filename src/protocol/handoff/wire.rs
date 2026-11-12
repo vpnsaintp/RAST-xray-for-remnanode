@@ -45,7 +45,7 @@ pub(crate) fn parse_header(header: &[u8]) -> Result<TransferHeader, HandoffError
         return Err(HandoffError::Version);
     }
     if raw[VERSION_OFFSET] != HANDOFF_PROTOCOL_VERSION
-        || raw[STATE_VERSION_OFFSET] != CONTINUATION_STATE_VERSION
+        || !matches!(raw[STATE_VERSION_OFFSET], 3 | CONTINUATION_STATE_VERSION)
     {
         return Err(HandoffError::Version);
     }

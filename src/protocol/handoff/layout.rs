@@ -13,8 +13,9 @@ pub const HANDOFF_PROTOCOL_VERSION: u8 = 1;
 /// - Version 1: rejected (cannot retain KeyUpdate state).
 /// - Version 2: TCP-only continuation without session-kind / policy snapshot;
 ///   rejected by this build (no silent reinterpret as XUDP).
-/// - Version 3: explicit [`SessionKind`](crate::protocol::handoff::SessionKind) + inbound tag + [`HandoffPolicySnapshot`](crate::protocol::handoff::HandoffPolicySnapshot).
-pub const CONTINUATION_STATE_VERSION: u8 = 3;
+/// - Version 3: explicit session kind, inbound tag and policy snapshot.
+/// - Version 4: adds the ingress source observed by LINE inside the authenticated blob.
+pub const CONTINUATION_STATE_VERSION: u8 = 4;
 
 /// Maximum inbound tag bytes sealed into a continuation (operator tag length).
 pub const MAX_INBOUND_TAG_LEN: usize = 64;

@@ -35,9 +35,10 @@ use crate::protocol::{
     },
 };
 use crate::server::outbound::{OutboundPermit, OutboundRegistry};
+use crate::transport::{FdBudget, FdPermit};
 
 /// Maximum concurrent GlobalID-keyed associations retained by this process.
-pub const XUDP_MAX_ASSOCIATIONS: usize = 256;
+pub const XUDP_MAX_ASSOCIATIONS: usize = 1024;
 
 /// Idle time after which an association is eligible for cleanup.
 pub const XUDP_ASSOCIATION_IDLE: Duration = Duration::from_secs(60);
@@ -217,10 +218,7 @@ impl fmt::Display for XudpSessionError {
             Self::NxrCarrier(error) => write!(formatter, "XUDP NXR carrier frame error: {error}"),
             Self::EgressCapabilityChanged => formatter
                 .write_str("XUDP Keep rewrite changed egress capability (no silent remapping)"),
-            Self::AssociationLimit => write!(
-                formatter,
-                "XUDP association limit ({XUDP_MAX_ASSOCIATIONS}) reached"
-            ),
+            Self::AssociationLimit => formatter.write_str("XUDP association limit reached"),
             Self::FdBudgetExhausted => formatter.write_str("XUDP UDP socket FD budget exhausted"),
             Self::MissingNewDestination => {
                 formatter.write_str("XUDP New frame missing UDP destination")
@@ -287,11 +285,17 @@ pub fn destination_to_socket_addr(
 
 /// GlobalID map (cone-NAT affinity), mirroring stock `XUDPManager`.
 ///
-/// Use [`process_xudp_global_map`] for the process-wide instance. Capacity
-/// [`XUDP_MAX_ASSOCIATIONS`] is enforced on that shared map, not per session.
-#[derive(Default)]
+/// Use [`process_xudp_global_map`] for the process-wide instance. Its capacity
+/// is enforced on that shared map, not per session.
 pub struct XudpGlobalMap {
     inner: Mutex<HashMap<XudpGlobalId, GlobalEntry>>,
+    capacity: usize,
+}
+
+impl Default for XudpGlobalMap {
+    fn default() -> Self {
+        Self::with_capacity(XUDP_MAX_ASSOCIATIONS)
+    }
 }
 
 struct GlobalEntry {
@@ -332,9 +336,20 @@ impl XudpGlobalMap {
         Self::default()
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Acquires one association lease for `owner` before fallible setup.
     ///
-    /// Capacity [`XUDP_MAX_ASSOCIATIONS`] is process-wide. An Active (or still
+    /// The configured capacity is process-wide. An Active (or still
     /// Expiring) id owned by a *different* user fails closed with
     /// [`XudpSessionError::AssociationConflict`] — no cross-user takeover.
     pub fn acquire(
@@ -358,7 +373,7 @@ impl XudpGlobalMap {
                 id,
             });
         }
-        if guard.len() >= XUDP_MAX_ASSOCIATIONS {
+        if guard.len() >= self.capacity {
             return Err(XudpSessionError::AssociationLimit);
         }
         guard.insert(
@@ -409,8 +424,9 @@ impl XudpGlobalMap {
 ///
 /// All Vision XUDP sessions share this map so capacity and affinity accounting
 /// are truly process-wide, not per Mux/TLS session.
+static GLOBALS: OnceLock<XudpGlobalMap> = OnceLock::new();
+
 pub fn process_xudp_global_map() -> &'static XudpGlobalMap {
-    static GLOBALS: OnceLock<XudpGlobalMap> = OnceLock::new();
     GLOBALS.get_or_init(XudpGlobalMap::new)
 }
 
@@ -427,7 +443,11 @@ pub fn process_xudp_global_map() -> &'static XudpGlobalMap {
 pub struct XudpDirectAssociation<'a> {
     v4: Option<UdpSocket>,
     v6: Option<UdpSocket>,
+    v4_permit: Option<FdPermit>,
+    v6_permit: Option<FdPermit>,
+    fd_budget: FdBudget,
     bind_ip: Option<IpAddr>,
+    strict_bind_ip: bool,
     destination: SocketAddr,
     global_lease: Option<XudpGlobalLease<'a>>,
     last_activity: Instant,
@@ -519,25 +539,86 @@ impl<'a> XudpDirectAssociation<'a> {
         global_id: Option<XudpGlobalId>,
         owner: [u8; 16],
         globals: &'a XudpGlobalMap,
+        fd_budget: FdBudget,
         now: Instant,
         bind_ip: Option<std::net::IpAddr>,
     ) -> Result<Self, XudpSessionError> {
+        Self::open_inner(
+            destination,
+            global_id,
+            owner,
+            globals,
+            fd_budget,
+            now,
+            bind_ip,
+            false,
+        )
+        .await
+    }
+
+    /// Direct egress on a two-IP node must never fall back to a wildcard
+    /// socket, including after an XUDP Keep destination rewrite.
+    pub async fn open_with_required_source(
+        destination: &Destination,
+        global_id: Option<XudpGlobalId>,
+        owner: [u8; 16],
+        globals: &'a XudpGlobalMap,
+        fd_budget: FdBudget,
+        now: Instant,
+        source_ip: IpAddr,
+    ) -> Result<Self, XudpSessionError> {
+        Self::open_inner(
+            destination,
+            global_id,
+            owner,
+            globals,
+            fd_budget,
+            now,
+            Some(source_ip),
+            true,
+        )
+        .await
+    }
+
+    async fn open_inner(
+        destination: &Destination,
+        global_id: Option<XudpGlobalId>,
+        owner: [u8; 16],
+        globals: &'a XudpGlobalMap,
+        fd_budget: FdBudget,
+        now: Instant,
+        bind_ip: Option<IpAddr>,
+        strict_bind_ip: bool,
+    ) -> Result<Self, XudpSessionError> {
         let addr = destination_to_socket_addr(destination)?;
+        if strict_bind_ip && bind_ip.is_some_and(|ip| ip.is_ipv6() != addr.is_ipv6()) {
+            return Err(XudpSessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "direct source IP family differs from UDP destination",
+            )));
+        }
         let global_lease = global_id
             .map(|id| globals.acquire(id, owner, now))
             .transpose()?;
+        let permit = fd_budget
+            .try_acquire(XUDP_FD_UNITS)
+            .ok_or(XudpSessionError::FdBudgetExhausted)?;
         let socket = bind_egress(bind_ip, addr.is_ipv6())
             .await
             .map_err(XudpSessionError::Io)?;
-        let (v4, v6) = if addr.is_ipv6() {
-            (None, Some(socket))
+        let (v4, v6, v4_permit, v6_permit) = if addr.is_ipv6() {
+            (None, Some(socket), None, Some(permit))
         } else {
-            (Some(socket), None)
+            (Some(socket), None, Some(permit), None)
         };
         Ok(Self {
             v4,
             v6,
+            v4_permit,
+            v6_permit,
+            fd_budget,
             bind_ip,
+            strict_bind_ip,
             destination: addr,
             global_lease,
             last_activity: now,
@@ -575,10 +656,27 @@ impl<'a> XudpDirectAssociation<'a> {
         destination: SocketAddr,
     ) -> Result<Option<&UdpSocket>, XudpSessionError> {
         let ipv6 = destination.is_ipv6();
+        if self.strict_bind_ip && self.bind_ip.is_some_and(|ip| ip.is_ipv6() != ipv6) {
+            return Err(XudpSessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "direct source IP family differs from UDP destination",
+            )));
+        }
         let slot = if ipv6 { &mut self.v6 } else { &mut self.v4 };
         if slot.is_none() {
+            let permit = self
+                .fd_budget
+                .try_acquire(XUDP_FD_UNITS)
+                .ok_or(XudpSessionError::FdBudgetExhausted)?;
             match bind_egress(self.bind_ip, ipv6).await {
-                Ok(socket) => *slot = Some(socket),
+                Ok(socket) => {
+                    *slot = Some(socket);
+                    if ipv6 {
+                        self.v6_permit = Some(permit);
+                    } else {
+                        self.v4_permit = Some(permit);
+                    }
+                }
                 Err(error) if is_unroutable_datagram_error(&error) => return Ok(None),
                 Err(error) => return Err(XudpSessionError::Io(error)),
             }
@@ -900,7 +998,7 @@ pub fn drain_xudp_frames(buffer: &mut Vec<u8>) -> Result<Vec<XudpPacket>, XudpSe
 mod tests {
     use super::*;
     use crate::protocol::vless::VISION_FLOW;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn authorize_direct_ok_and_landward_direct() {
@@ -992,6 +1090,90 @@ mod tests {
     }
 
     #[test]
+    fn three_hundred_distinct_sessions_have_admission_when_budget_allows() {
+        let map = XudpGlobalMap::with_capacity(300);
+        let now = Instant::now();
+        let mut leases = Vec::new();
+        for user in 0_u8..100 {
+            for session in 0_u8..3 {
+                let id = [user, session, 0, 0, 0, 0, 0, 0];
+                leases.push(map.acquire(id, [user; 16], now).unwrap());
+            }
+        }
+        assert_eq!(map.len(), 300);
+        assert!(matches!(
+            map.acquire([100, 0, 0, 0, 0, 0, 0, 0], [100; 16], now),
+            Err(XudpSessionError::AssociationLimit)
+        ));
+        assert_eq!(leases.len(), 300);
+    }
+
+    #[tokio::test]
+    async fn direct_udp_socket_holds_and_releases_fd_permit() {
+        let budget = FdBudget::new(1);
+        let globals = XudpGlobalMap::new();
+        let dest = Destination::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 9);
+        let assoc = XudpDirectAssociation::open(
+            &dest,
+            None,
+            [1; 16],
+            &globals,
+            budget.clone(),
+            Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.in_use(), 1);
+        assert!(matches!(
+            XudpDirectAssociation::open(
+                &dest,
+                None,
+                [2; 16],
+                &globals,
+                budget.clone(),
+                Instant::now(),
+                None,
+            )
+            .await,
+            Err(XudpSessionError::FdBudgetExhausted)
+        ));
+        drop(assoc);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn family_rewrite_cannot_create_an_unbudgeted_second_socket() {
+        let budget = FdBudget::new(1);
+        let globals = XudpGlobalMap::new();
+        let first = Destination::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 9);
+        let second = Destination::new(Address::Ipv6(Ipv6Addr::LOCALHOST), 9);
+        let mut assoc = XudpDirectAssociation::open(
+            &first,
+            None,
+            [1; 16],
+            &globals,
+            budget.clone(),
+            Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut wire = Vec::new();
+        encode_xudp_packet(&second, b"one", false, None, true, &mut wire).unwrap();
+        let packet = decode_xudp_packet(&wire).unwrap().0;
+        assert!(matches!(
+            assoc
+                .handle_uplink_packet(&packet, Some(&second), Instant::now())
+                .await,
+            Err(XudpSessionError::FdBudgetExhausted)
+        ));
+        assert_eq!(budget.in_use(), 1);
+        drop(assoc);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[test]
     fn cancelling_a_pending_owner_releases_its_global_lease() {
         let map = XudpGlobalMap::new();
         let mut pending = Box::pin(async {
@@ -1032,10 +1214,17 @@ mod tests {
         let dest = Destination::from(echo_addr);
         let globals = XudpGlobalMap::new();
         let now = Instant::now();
-        let mut assoc =
-            XudpDirectAssociation::open(&dest, Some([9; 8]), [9; 16], &globals, now, None)
-                .await
-                .unwrap();
+        let mut assoc = XudpDirectAssociation::open(
+            &dest,
+            Some([9; 8]),
+            [9; 16],
+            &globals,
+            FdBudget::new(8),
+            now,
+            None,
+        )
+        .await
+        .unwrap();
 
         let packet = {
             let mut wire = Vec::new();
@@ -1107,6 +1296,7 @@ mod tests {
             Some([7; 8]),
             [7; 16],
             &globals,
+            FdBudget::new(8),
             Instant::now(),
             None,
         )
@@ -1157,6 +1347,7 @@ mod tests {
             None,
             [8; 16],
             &globals,
+            FdBudget::new(8),
             Instant::now(),
             Some(IpAddr::from([127, 0, 0, 1])),
         )
@@ -1218,16 +1409,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_direct_udp_source_is_observed_and_never_falls_back_to_ipv6() {
+        let receiver = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind receiver");
+        let destination = Destination::from(receiver.local_addr().expect("receiver address"));
+        let globals = XudpGlobalMap::new();
+        let source: IpAddr = Ipv4Addr::new(127, 0, 0, 2).into();
+        let mut association = XudpDirectAssociation::open_with_required_source(
+            &destination,
+            None,
+            [8; 16],
+            &globals,
+            FdBudget::new(16),
+            Instant::now(),
+            source,
+        )
+        .await
+        .expect("open sourced association");
+        let mut wire = Vec::new();
+        encode_xudp_packet(&destination, b"egress", true, None, false, &mut wire)
+            .expect("encode UDP packet");
+        let packet = decode_xudp_packet(&wire).expect("decode UDP packet").0;
+        association
+            .handle_uplink_packet(&packet, Some(&destination), Instant::now())
+            .await
+            .expect("send UDP packet");
+        let mut received = [0_u8; 16];
+        let (length, peer) = receiver
+            .recv_from(&mut received)
+            .await
+            .expect("receive UDP");
+        assert_eq!(&received[..length], b"egress");
+        assert_eq!(peer.ip(), source);
+        let ipv6 = Destination::new(Address::Ipv6(std::net::Ipv6Addr::LOCALHOST), 9);
+        assert!(
+            XudpDirectAssociation::open_with_required_source(
+                &ipv6,
+                None,
+                [8; 16],
+                &globals,
+                FdBudget::new(16),
+                Instant::now(),
+                source,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn uplink_rewrite_without_authorization_fails_closed() {
         let echo = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
         let dest = Destination::from(echo.local_addr().unwrap());
         let globals = XudpGlobalMap::new();
-        let mut assoc =
-            XudpDirectAssociation::open(&dest, None, [2; 16], &globals, Instant::now(), None)
-                .await
-                .unwrap();
+        let mut assoc = XudpDirectAssociation::open(
+            &dest,
+            None,
+            [2; 16],
+            &globals,
+            FdBudget::new(8),
+            Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
         let blocked = Destination::new(Address::Ipv4(Ipv4Addr::new(10, 0, 0, 1)), 9);
         let packet = {
             let mut wire = Vec::new();
@@ -1288,17 +1536,33 @@ mod tests {
         let globals = XudpGlobalMap::new();
         let now = Instant::now();
         let gid = [7_u8; 8];
-        let assoc = XudpDirectAssociation::open(&dest, Some(gid), [7; 16], &globals, now, None)
-            .await
-            .unwrap();
+        let assoc = XudpDirectAssociation::open(
+            &dest,
+            Some(gid),
+            [7; 16],
+            &globals,
+            FdBudget::new(8),
+            now,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(globals.len(), 1);
         // close marks the GlobalID expired; purge drops it (control-EOF / cancel path).
         assoc.close(now);
         globals.purge(now + XUDP_ASSOCIATION_IDLE + Duration::from_secs(1));
         assert_eq!(globals.len(), 0);
-        let again = XudpDirectAssociation::open(&dest, Some(gid), [7; 16], &globals, now, None)
-            .await
-            .unwrap();
+        let again = XudpDirectAssociation::open(
+            &dest,
+            Some(gid),
+            [7; 16],
+            &globals,
+            FdBudget::new(8),
+            now,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(globals.len(), 1);
         again.close(now);
     }

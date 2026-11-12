@@ -11,12 +11,12 @@
 use std::{
     error::Error,
     fmt, io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
 use tokio::{
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     task::JoinSet,
     time::{self, Instant},
 };
@@ -69,6 +69,7 @@ pub(crate) async fn connect_target(target: &str) -> io::Result<TcpStream> {
 pub struct DestinationConnector {
     connect_timeout: Duration,
     planner: ConnectionPlanner,
+    source_ip: Option<Ipv4Addr>,
 }
 
 impl DestinationConnector {
@@ -90,6 +91,7 @@ impl DestinationConnector {
         Self {
             connect_timeout,
             planner: ConnectionPlanner::new(DialTuning::for_policy(config.ip()), environment),
+            source_ip: None,
         }
     }
 
@@ -104,6 +106,17 @@ impl DestinationConnector {
         Self {
             connect_timeout,
             planner: self.planner.clone(),
+            source_ip: self.source_ip,
+        }
+    }
+
+    /// Bind only direct user destinations to the operator's egress IPv4.
+    #[must_use]
+    pub fn with_source_ip(&self, source_ip: Option<Ipv4Addr>) -> Self {
+        Self {
+            connect_timeout: self.connect_timeout,
+            planner: self.planner.clone(),
+            source_ip,
         }
     }
 
@@ -355,13 +368,28 @@ impl DestinationConnector {
         deadline: Instant,
         fd_budget: Option<FdBudget>,
     ) -> Result<(TcpStream, Option<FdPermit>), DestinationConnectError> {
+        let source_ip = self.source_ip;
         race_with(
             self.planner.clone(),
             addresses,
             deadline,
             self.connect_timeout,
             fd_budget,
-            TcpStream::connect,
+            move |address| async move {
+                if let Some(source_ip) = source_ip {
+                    if !address.is_ipv4() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "direct source IPv4 cannot dial an IPv6 destination",
+                        ));
+                    }
+                    let socket = TcpSocket::new_v4()?;
+                    socket.bind(SocketAddr::new(IpAddr::V4(source_ip), 0))?;
+                    socket.connect(address).await
+                } else {
+                    TcpStream::connect(address).await
+                }
+            },
         )
         .await
     }

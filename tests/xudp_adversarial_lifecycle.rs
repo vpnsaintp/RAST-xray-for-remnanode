@@ -34,6 +34,7 @@ use rust_reality::server::xudp::{
     XudpGlobalMap, XudpOutboundUnsupported, XudpRouteClass, XudpSessionError,
     authorize_xudp_egress, drain_xudp_frames, require_direct_xudp_landward,
 };
+use rust_reality::transport::FdBudget;
 use tokio::net::UdpSocket;
 
 fn dest_ip(ip: [u8; 4], port: u16) -> Destination {
@@ -66,10 +67,17 @@ async fn downlink_peer_cannot_replace_the_authorized_uplink_destination() {
     let allowed_addr = allowed.local_addr().unwrap();
     let dest = dest_ip([127, 0, 0, 1], allowed_addr.port());
     let globals = XudpGlobalMap::new();
-    let mut association =
-        XudpDirectAssociation::open(&dest, None, [0x42; 16], &globals, Instant::now(), None)
-            .await
-            .unwrap();
+    let mut association = XudpDirectAssociation::open(
+        &dest,
+        None,
+        [0x42; 16],
+        &globals,
+        FdBudget::new(4096),
+        Instant::now(),
+        None,
+    )
+    .await
+    .unwrap();
     association
         .handle_uplink_packet(
             &packet_new(&dest, b"open", None),
@@ -154,6 +162,7 @@ async fn rewrite_direct_to_block_rejects_and_sends_zero_datagrams() {
         Some([1; 8]),
         owner,
         &globals,
+        FdBudget::new(4096),
         Instant::now(),
         None,
     )
@@ -339,18 +348,34 @@ async fn association_cancel_then_recover_same_global_id() {
     let gid = [0x77_u8; 8];
     let now = Instant::now();
 
-    let assoc = XudpDirectAssociation::open(&dest, Some(gid), owner, &globals, now, None)
-        .await
-        .unwrap();
+    let assoc = XudpDirectAssociation::open(
+        &dest,
+        Some(gid),
+        owner,
+        &globals,
+        FdBudget::new(4096),
+        now,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(globals.len(), 1);
     // Control-EOF / cancel path: close marks Expiring; purge frees the slot.
     assoc.close(now);
     globals.purge(now + XUDP_ASSOCIATION_IDLE + Duration::from_secs(1));
     assert_eq!(globals.len(), 0);
 
-    let mut again = XudpDirectAssociation::open(&dest, Some(gid), owner, &globals, now, None)
-        .await
-        .unwrap();
+    let mut again = XudpDirectAssociation::open(
+        &dest,
+        Some(gid),
+        owner,
+        &globals,
+        FdBudget::new(4096),
+        now,
+        None,
+    )
+    .await
+    .unwrap();
     let open = packet_new(&dest, b"recovered", Some(gid));
     again
         .handle_uplink_packet(&open, Some(&dest), Instant::now())
@@ -372,6 +397,7 @@ async fn dropped_association_releases_global_id_without_explicit_close() {
         Some([0x91; 8]),
         [0x91; 16],
         &globals,
+        FdBudget::new(4096),
         Instant::now(),
         None,
     )
@@ -426,14 +452,28 @@ async fn closing_one_same_owner_association_keeps_the_other_global_id_live() {
     let globals = XudpGlobalMap::new();
     let dest = dest_ip([127, 0, 0, 1], 9);
     let now = Instant::now();
-    let first =
-        XudpDirectAssociation::open(&dest, Some([0x93; 8]), [0x93; 16], &globals, now, None)
-            .await
-            .unwrap();
-    let second =
-        XudpDirectAssociation::open(&dest, Some([0x93; 8]), [0x93; 16], &globals, now, None)
-            .await
-            .unwrap();
+    let first = XudpDirectAssociation::open(
+        &dest,
+        Some([0x93; 8]),
+        [0x93; 16],
+        &globals,
+        FdBudget::new(4096),
+        now,
+        None,
+    )
+    .await
+    .unwrap();
+    let second = XudpDirectAssociation::open(
+        &dest,
+        Some([0x93; 8]),
+        [0x93; 16],
+        &globals,
+        FdBudget::new(4096),
+        now,
+        None,
+    )
+    .await
+    .unwrap();
     first.close(now);
     let after_grace = now + XUDP_ASSOCIATION_IDLE + Duration::from_secs(1);
     globals.purge(after_grace);
@@ -448,6 +488,7 @@ async fn closing_one_same_owner_association_keeps_the_other_global_id_live() {
             Some([0x93; 8]),
             [0x94; 16],
             &globals,
+            FdBudget::new(4096),
             after_grace,
             None,
         )
@@ -500,10 +541,17 @@ async fn fail_detection_demo_unauthorized_rewrite_gate() {
         .unwrap();
     let dest = dest_ip([127, 0, 0, 1], echo.local_addr().unwrap().port());
     let globals = XudpGlobalMap::new();
-    let mut assoc =
-        XudpDirectAssociation::open(&dest, None, [0xFD; 16], &globals, Instant::now(), None)
-            .await
-            .unwrap();
+    let mut assoc = XudpDirectAssociation::open(
+        &dest,
+        None,
+        [0xFD; 16],
+        &globals,
+        FdBudget::new(4096),
+        Instant::now(),
+        None,
+    )
+    .await
+    .unwrap();
     let blocked = dest_ip([203, 0, 113, 1], 9); // TEST-NET-3
     let rewrite = packet_keep_rewrite(&blocked, b"should-not-leave");
     assert!(rewrite.destination.is_some());
@@ -590,9 +638,17 @@ async fn association_resource_recovery_after_repeated_fault_cycles() {
         let mut gid = [0xA1_u8; 8];
         gid[7] = i as u8;
         let now = Instant::now();
-        let mut assoc = XudpDirectAssociation::open(&dest, Some(gid), owner, &globals, now, None)
-            .await
-            .unwrap();
+        let mut assoc = XudpDirectAssociation::open(
+            &dest,
+            Some(gid),
+            owner,
+            &globals,
+            FdBudget::new(4096),
+            now,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(globals.len(), 1, "cycle {i}: one live association");
         let open = packet_new(&dest, b"pulse", Some(gid));
         assoc
@@ -658,6 +714,7 @@ async fn rewrite_cross_outbound_direct_landward_rejects_nxr_handoff() {
         Some([0xC0; 8]),
         [0xC0; 16],
         &globals,
+        FdBudget::new(4096),
         Instant::now(),
         None,
     )
@@ -748,10 +805,17 @@ async fn reload_retirement_does_not_widen_in_flight_authority() {
     let globals = XudpGlobalMap::new();
     let owner = [0xD1; 16];
     let gid = [0xD1; 8];
-    let mut assoc =
-        XudpDirectAssociation::open(&dest, Some(gid), owner, &globals, Instant::now(), None)
-            .await
-            .unwrap();
+    let mut assoc = XudpDirectAssociation::open(
+        &dest,
+        Some(gid),
+        owner,
+        &globals,
+        FdBudget::new(4096),
+        Instant::now(),
+        None,
+    )
+    .await
+    .unwrap();
     let open = packet_new(&dest, b"gen1", Some(gid));
     assoc
         .handle_uplink_packet(&open, Some(&dest), Instant::now())
@@ -773,10 +837,17 @@ async fn reload_retirement_does_not_widen_in_flight_authority() {
     assoc.close(Instant::now());
     globals.purge(Instant::now() + XUDP_ASSOCIATION_IDLE + Duration::from_secs(1));
     assert_eq!(globals.len(), 0);
-    let mut again =
-        XudpDirectAssociation::open(&dest, Some(gid), owner, &globals, Instant::now(), None)
-            .await
-            .unwrap();
+    let mut again = XudpDirectAssociation::open(
+        &dest,
+        Some(gid),
+        owner,
+        &globals,
+        FdBudget::new(4096),
+        Instant::now(),
+        None,
+    )
+    .await
+    .unwrap();
     let reopen = packet_new(&dest, b"gen2", Some(gid));
     again
         .handle_uplink_packet(&reopen, Some(&dest), Instant::now())

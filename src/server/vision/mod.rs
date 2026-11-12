@@ -15,6 +15,7 @@ use crate::protocol::vless::VERSION;
 use crate::{
     accounting::{UsageLedger, UsageSession},
     logging::{LogEvent, Logger},
+    protocol::handoff::IngressSource,
     protocol::vless::UserId,
 };
 
@@ -31,7 +32,7 @@ use crate::runtime::policy::EffectivePolicy;
 use crate::runtime::policy::ResourceGovernorPolicy;
 use crate::transport::TcpRelay;
 
-mod bittorrent_monitor;
+pub(crate) mod bittorrent_monitor;
 mod bittorrent_sniff;
 mod nested;
 
@@ -519,6 +520,13 @@ impl VisionHandler {
                         client_random,
                         inbound_tag,
                         usage,
+                        peer.map(|ip| {
+                            if proxy_source_verified {
+                                IngressSource::ProxyV1Verified(ip)
+                            } else {
+                                IngressSource::TcpPeerObserved(ip)
+                            }
+                        }),
                     )
                     .await;
             }
@@ -533,7 +541,7 @@ impl VisionHandler {
         };
         let (destination_stream, outbound_permit) = connection.into_parts();
         let (destination_reader, destination_writer) = destination_stream.into_split();
-        let protocol_monitor = if proxy_source_verified {
+        let protocol_monitor =
             self.access_log
                 .as_ref()
                 .zip(peer)
@@ -543,15 +551,17 @@ impl VisionHandler {
                         BitTorrentMonitor::new(
                             logger,
                             source_ip,
+                            if proxy_source_verified {
+                                "proxy_v1_verified"
+                            } else {
+                                "tcp_peer_observed"
+                            },
                             panel_user_id,
                             inbound_tag,
                             &destination,
                         )
                     })
-                })
-        } else {
-            None
-        };
+                });
         // The decoder accepted VLESS v0 and this inbound never negotiates
         // response Addons, so the response is a fixed stack value.
         let response_header = [VERSION, 0];

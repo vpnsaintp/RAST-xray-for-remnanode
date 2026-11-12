@@ -5,7 +5,7 @@
 //! modularization only — no wire, crypto, or trust changes.
 
 use crate::protocol::handoff::{
-    ContinuationState, HandoffError, HandoffPolicySnapshot, SessionKind,
+    ContinuationState, HandoffError, HandoffPolicySnapshot, IngressSource, SessionKind,
 };
 use crate::server::handoff::HandoffLineError;
 use crate::server::xudp::XudpSessionError;
@@ -47,6 +47,7 @@ impl VisionHandler {
         client_random: [u8; 32],
         inbound_tag: &str,
         _usage: Option<UsageSession>,
+        ingress_source: Option<IngressSource>,
     ) -> Result<VisionRelayStats, VisionSessionError> {
         let VisionClientHalves {
             reader: client_reader,
@@ -84,7 +85,7 @@ impl VisionHandler {
                 .into_parts();
             let prefetched = buffer.get(prefetched).unwrap_or_default().to_vec();
             let policy = HandoffPolicySnapshot::tcp_placeholder(destination.clone());
-            let state = ContinuationState::new(
+            let mut state = ContinuationState::new(
                 suite,
                 client_traffic_secret,
                 client_sequence,
@@ -101,6 +102,9 @@ impl VisionHandler {
             )
             .map_err(HandoffLineError::Transfer)
             .map_err(VisionSessionError::HandoffLine)?;
+            if let Some(source) = ingress_source {
+                state = state.with_ingress_source(source);
+            }
             let transferred = line
                 .transfer(self.relay.fd_budget(), &state, client_random)
                 .await

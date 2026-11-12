@@ -191,6 +191,9 @@ pub fn open_transfer(
         return Err(HandoffError::Authentication);
     }
 
+    if blob.first().copied() != Some(header.raw[super::STATE_VERSION_OFFSET]) {
+        return Err(HandoffError::State);
+    }
     let state = decode_blob(&blob)?;
     if state.server_sequence() > MAX_SERVER_SEQUENCE_AT_HANDOFF
         || state.user_id() != &header.user_id

@@ -403,7 +403,7 @@ fn compile_landing_handler(
             } else {
                 handler.with_revocation(authorities.revoker.clone())
             };
-            ConnectionHandler::Handoff(handler)
+            ConnectionHandler::Handoff(handler.with_access_log(logger.clone()))
         }
     };
     Ok((handler, outbounds))

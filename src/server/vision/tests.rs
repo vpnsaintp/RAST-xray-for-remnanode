@@ -49,11 +49,11 @@ const USER: UserId = UserId::new([0x33; 16]);
 static BT_TEST_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "current_thread")]
-async fn bittorrent_proof_needs_forwarded_prefix_and_verified_proxy_source() {
+async fn bittorrent_proof_tracks_forwarded_prefix_and_source_origin() {
     run_bittorrent_proof_case(b"\x13BitTorrent protocol\0", None, true, true).await;
     run_bittorrent_proof_case(b"\x13Bit", Some(b"Torrent protocol\0"), true, true).await;
     run_bittorrent_proof_case(b"\x13BitTorrent protocOl", None, true, false).await;
-    run_bittorrent_proof_case(b"\x13BitTorrent protocol", None, false, false).await;
+    run_bittorrent_proof_case(b"\x13BitTorrent protocol", None, false, true).await;
 }
 
 async fn run_bittorrent_proof_case(
@@ -171,11 +171,101 @@ async fn run_bittorrent_proof_case(
         assert_eq!(proof["entry"], "test-reality");
         assert_eq!(proof["panel_user_id"], 42);
         assert_eq!(proof["source_ip"], "198.51.100.7");
-        assert_eq!(proof["source_attribution"], "proxy_v1_verified");
+        assert_eq!(
+            proof["source_attribution"],
+            if proxy_source_verified {
+                "proxy_v1_verified"
+            } else {
+                "tcp_peer_observed"
+            }
+        );
         assert_eq!(proof["destination"], format!("127.0.0.1:{port}"));
         assert_eq!(proof["proof"], "client_tcp_handshake_prefix_v1");
     }
     std::fs::remove_file(path).expect("test log cleanup");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_session_detects_bittorrent_in_forwarded_prefetch() {
+    use crate::config::node::log::{FileLogConfig, LogConfig, LogLevel, LogOutput};
+    use crate::logging::Logger;
+    use crate::protocol::vless::{Address, Destination};
+
+    let path = std::env::temp_dir().join(format!(
+        "rr-resumed-bittorrent-{}-{}.log",
+        std::process::id(),
+        BT_TEST_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let logger = Logger::new(&LogConfig {
+        level: Some(LogLevel::Info),
+        output: Some(LogOutput::File),
+        file: Some(FileLogConfig {
+            path: path.clone(),
+            max_bytes: Some(64 * 1024),
+            max_files: Some(1),
+            max_total_bytes: Some(64 * 1024),
+        }),
+    })
+    .expect("proof logger");
+    let (mut client, inbound) = tcp_pair().await;
+    let (destination_stream, mut target) = tcp_pair().await;
+    let (tls, mut client_write, _client_read) = tls_states();
+    let (reader, writer) = TlsApplicationIo::new(inbound, tls).into_owned_split();
+    let relay = TcpRelay::new(TcpRelayConfig::for_test(), FdBudget::new(4_096)).expect("relay");
+    let destination = Destination::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 51413);
+    let monitor = super::bittorrent_monitor::BitTorrentMonitor::new(
+        &logger,
+        Ipv4Addr::new(198, 51, 100, 7).into(),
+        "proxy_v1_verified",
+        42,
+        "test-reality",
+        &destination,
+    );
+    let payload = b"\x13BitTorrent protocol\0";
+    let mut encoder = VisionEncoder::with_padding_seed(USER, &[0x5a; 44]);
+    let mut prefetched = Vec::new();
+    encoder
+        .encode(payload, VisionCommand::End, false, &mut prefetched)
+        .expect("frame");
+    let session = super::run_resumed_session(
+        super::VisionClientHalves::new(reader, writer),
+        destination_stream,
+        USER,
+        None,
+        prefetched,
+        &relay,
+        TEST_TIMEOUT,
+        Some(monitor),
+    );
+    let peer = async {
+        let mut forwarded = vec![0; payload.len()];
+        target.read_exact(&mut forwarded).await?;
+        assert_eq!(forwarded, payload);
+        target.shutdown().await?;
+        let mut wire = Vec::new();
+        client_write
+            .seal_into(ContentType::Alert, &[1, 0], 0, &mut wire)
+            .map_err(io::Error::other)?;
+        client.write_all(&wire).await?;
+        client.shutdown().await?;
+        Ok::<_, io::Error>(())
+    };
+    let (session, peer) = timeout(TEST_TIMEOUT, async { tokio::join!(session, peer) })
+        .await
+        .expect("bounded resumed exchange");
+    session.expect("resumed relay");
+    peer.expect("peer I/O");
+    let rows = std::fs::read_to_string(&path).expect("proof log");
+    let proofs: Vec<_> = rows
+        .lines()
+        .filter(|line| line.contains("\"event\":\"protocol_detected\""))
+        .collect();
+    assert_eq!(proofs.len(), 1);
+    let proof: serde_json::Value = serde_json::from_str(proofs[0]).expect("proof JSON");
+    assert_eq!(proof["source_ip"], "198.51.100.7");
+    assert_eq!(proof["source_attribution"], "proxy_v1_verified");
+    assert_eq!(proof["panel_user_id"], 42);
+    std::fs::remove_file(path).expect("proof log cleanup");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -309,6 +399,7 @@ async fn resumed_framed_session_survives_both_asymmetries_and_sparse_alternation
         initial,
         &relay,
         Duration::from_millis(20),
+        None,
     );
     let traffic = async {
         let mut request = [0; 7];
@@ -1637,6 +1728,7 @@ async fn short_resumed_response_precedes_origin_fin_with_or_without_uplink_fin()
             initial,
             &relay,
             TEST_TIMEOUT,
+            None,
         );
         let traffic = async {
             let mut request = [0; 7];
@@ -2648,6 +2740,7 @@ async fn open_framed(initial: &[u8], seed: u8) -> LiveSession {
             request,
             &relay,
             crate::io_activity::WRITE_STALL_TIMEOUT,
+            None,
         )
         .await
     });

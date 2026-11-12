@@ -139,6 +139,7 @@ pub struct OutboundRegistry {
     connect_timeout: Duration,
     fd_budget: FdBudget,
     connector: DestinationConnector,
+    direct_source_ip: Option<std::net::Ipv4Addr>,
 }
 
 impl OutboundRegistry {
@@ -256,6 +257,7 @@ impl OutboundRegistry {
             connect_timeout,
             fd_budget,
             connector,
+            direct_source_ip: network.direct_source_ip,
         }
     }
 
@@ -382,6 +384,7 @@ impl OutboundRegistry {
                     .map_err(OutboundConnectError::Admission)?;
                 let connected = self
                     .connector
+                    .with_source_ip(self.direct_source_ip)
                     .connect_resolved_accounted(destination, resolved_ips, &self.fd_budget)
                     .await
                     .map_err(map_direct_error)?;
@@ -439,6 +442,11 @@ impl OutboundRegistry {
             // serves a plain destination dial.
             CompiledOutbound::Handoff(_) => Err(OutboundConnectError::HandoffUnsupported),
         }
+    }
+
+    /// Required direct egress source, if configured for a two-address node.
+    pub const fn direct_source_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.direct_source_ip
     }
 
     /// Returns whether a validated tag is present in this immutable snapshot.

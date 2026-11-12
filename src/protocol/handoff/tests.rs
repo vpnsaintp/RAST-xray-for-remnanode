@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
@@ -11,10 +14,10 @@ use super::blob::{decode_blob, encode_blob};
 use super::{
     CONTINUATION_STATE_VERSION, ContinuationState, HANDOFF_PROTOCOL_VERSION, HEADER_LEN,
     HandoffError, HandoffLandingKeys, HandoffPolicySnapshot, HandoffPsk, HandoffReplayCache,
-    MAX_BLOB_LEN, MAX_MESSAGE_LEN, MAX_PENDING_CIPHERTEXT_LEN, MAX_PREFETCHED_PLAINTEXT_LEN,
-    MAX_PREVIOUS_KEYS, MonotonicInstant, NONCE_LEN, STATE_VERSION_OFFSET, SealedDomainMatcher,
-    SealedHandoffRouteRule, SealedIpNetwork, SealedPortRange, SessionKind, message_len_from_header,
-    open_transfer, seal_transfer,
+    IngressSource, MAX_BLOB_LEN, MAX_MESSAGE_LEN, MAX_PENDING_CIPHERTEXT_LEN,
+    MAX_PREFETCHED_PLAINTEXT_LEN, MAX_PREVIOUS_KEYS, MonotonicInstant, NONCE_LEN,
+    STATE_VERSION_OFFSET, SealedDomainMatcher, SealedHandoffRouteRule, SealedIpNetwork,
+    SealedPortRange, SessionKind, message_len_from_header, open_transfer, seal_transfer,
 };
 use crate::crypto::StaticX25519Key;
 use crate::protocol::reality::tls13::{CipherSuite, HashAlgorithm, TrafficSecret};
@@ -109,6 +112,7 @@ fn assert_states_equal(opened: &ContinuationState, expected: &ContinuationState)
     );
     assert_eq!(opened.session_kind(), expected.session_kind());
     assert_eq!(opened.inbound_tag(), expected.inbound_tag());
+    assert_eq!(opened.ingress_source(), expected.ingress_source());
     assert_eq!(opened.user_id(), expected.user_id());
     assert_eq!(opened.destination(), expected.destination());
     assert_eq!(opened.policy(), expected.policy());
@@ -141,6 +145,85 @@ fn sealed_transfer_round_trips_through_landing_open() {
     .expect("valid transfer must open");
     assert_eq!(opened.timestamp(), NOW);
     assert_eq!(opened.client_random(), &[0x44; 32]);
+    assert_states_equal(opened.state(), &state);
+}
+
+#[test]
+fn authenticated_ingress_source_round_trips_for_both_families_and_attributions() {
+    let (secret, public) = landing_key_pair(0x77);
+    let psk = HandoffPsk::new([0x55; 32]);
+    let keys = HandoffLandingKeys::single(psk.clone(), StaticX25519Key::new(&secret));
+    for source in [
+        IngressSource::ProxyV1Verified(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+        IngressSource::ProxyV1Verified(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        IngressSource::TcpPeerObserved(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))),
+        IngressSource::TcpPeerObserved(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    ] {
+        let state = test_state(Vec::new(), Vec::new()).with_ingress_source(source);
+        let message = seal(&state, &psk, &public);
+        let opened = open_transfer(&message, &keys, &test_cache(), NOW, WINDOW)
+            .expect("authenticated source survives handoff");
+        assert_eq!(opened.state().ingress_source(), Some(source));
+        let mut tampered = message;
+        // Source lives in AEAD ciphertext; a bit flip cannot change attribution.
+        tampered[HEADER_LEN + 1 + 2 + 64 + 16 + 1 + 1 + 16 + 1 + 14 + 1] ^= 1;
+        assert_eq!(
+            open_error(&tampered, &psk, &secret, &test_cache(), NOW),
+            HandoffError::Authentication
+        );
+    }
+}
+
+#[test]
+fn v3_blob_remains_readable_without_source_and_v4_rejects_bad_source_tag() {
+    let state = test_state(Vec::new(), Vec::new());
+    let mut v4 = Vec::new();
+    encode_blob(&state, &mut v4).expect("v4 blob");
+    // Fixed fields through user ID, then one length byte and the ASCII tag.
+    let source_offset = 1 + 2 + 64 + 16 + 1 + 1 + 16 + 1 + state.inbound_tag().len();
+    assert_eq!(v4[source_offset], 0);
+    let mut bad_tag = v4.clone();
+    bad_tag[source_offset] = 0xff;
+    assert_eq!(decode_blob(&bad_tag).unwrap_err(), HandoffError::State);
+    let mut v3 = v4;
+    v3[0] = 3;
+    v3.remove(source_offset);
+    let old = decode_blob(&v3).expect("v3 landing-first compatibility");
+    assert_eq!(old.ingress_source(), None);
+    assert_states_equal(&old, &state);
+}
+
+#[test]
+fn landing_opens_authenticated_v3_transfer_for_landing_first_upgrade() {
+    let (secret, public) = landing_key_pair(0x77);
+    let psk = HandoffPsk::new([0x55; 32]);
+    let state = test_state(Vec::new(), Vec::new());
+    let v4 = seal(&state, &psk, &public);
+    let mut header: [u8; HEADER_LEN] = v4[..HEADER_LEN].try_into().unwrap();
+    let mut blob = Vec::new();
+    encode_blob(&state, &mut blob).unwrap();
+    let source_offset = 1 + 2 + 64 + 16 + 1 + 1 + 16 + 1 + state.inbound_tag().len();
+    blob[0] = 3;
+    blob.remove(source_offset);
+    header[STATE_VERSION_OFFSET] = 3;
+    header[super::BLOB_LEN_OFFSET..super::BLOB_LEN_OFFSET + 4]
+        .copy_from_slice(&(blob.len() as u32).to_be_bytes());
+    let ephemeral: [u8; 32] = header[super::EPHEMERAL_OFFSET..super::CLIENT_RANDOM_OFFSET]
+        .try_into()
+        .unwrap();
+    let shared = StaticX25519Key::new(&secret).agree(&ephemeral).unwrap();
+    let (key, nonce) = super::transfer::derive_aead(&header, &shared, &psk, &public).unwrap();
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_slice()).unwrap();
+    let tag = cipher
+        .encrypt_inout_detached(&Array(*nonce), &header, blob.as_mut_slice().into())
+        .unwrap();
+    let mut legacy = header.to_vec();
+    legacy.extend_from_slice(&blob);
+    legacy.extend_from_slice(&tag);
+    let keys = HandoffLandingKeys::single(psk, StaticX25519Key::new(&secret));
+    let opened = open_transfer(&legacy, &keys, &test_cache(), NOW, WINDOW)
+        .expect("new landing accepts old LINE transfer");
+    assert_eq!(opened.state().ingress_source(), None);
     assert_states_equal(opened.state(), &state);
 }
 
@@ -317,7 +400,7 @@ fn version_mismatches_fail_closed() {
         }
     }
     assert_eq!(HANDOFF_PROTOCOL_VERSION, 1);
-    assert_eq!(CONTINUATION_STATE_VERSION, 3);
+    assert_eq!(CONTINUATION_STATE_VERSION, 4);
 }
 
 #[test]

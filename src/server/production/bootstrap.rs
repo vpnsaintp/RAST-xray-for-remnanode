@@ -124,8 +124,12 @@ pub(super) fn build(
     // admission governor apply to every connector-side lookup. First-wins
     // keeps reload generations on the one installed resolver.
     let _ = crate::server::dns::install_shared(
-        DnsResolver::from_config(&node.dns(), authorities.governor.clone())
-            .map_err(ProductionServerError::Dns)?,
+        DnsResolver::from_config_with_source(
+            &node.dns(),
+            authorities.governor.clone(),
+            node.network().direct_source_ip,
+        )
+        .map_err(ProductionServerError::Dns)?,
     );
     let replay = ReplayCache::new(authorities.governor.clone(), &policy.governor);
     let listener_replays = ListenerReplays {

@@ -50,7 +50,7 @@ pub use policy::{
     SealedIpNetwork, SealedPortRange, SessionKind,
 };
 pub use replay::HandoffReplayCache;
-pub use state::{ContinuationParts, ContinuationState, OpenedTransfer};
+pub use state::{ContinuationParts, ContinuationState, IngressSource, OpenedTransfer};
 pub use transfer::{open_transfer, seal_transfer};
 pub use wire::message_len_from_header;
 

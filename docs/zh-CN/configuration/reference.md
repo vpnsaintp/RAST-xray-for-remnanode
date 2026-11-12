@@ -315,6 +315,11 @@ short ID 是 2–16 个十六进制字符，个数为偶数。客户端每个连
 | 字段 | 类型 | 不写表示 |
 | --- | --- | --- |
 | `ip` | `"auto"` \| `"preferIpv4"` \| `"preferIpv6"` \| `"ipv4Only"` \| `"ipv6Only"` | `"auto"` |
+| `directSourceIp` | IPv4 地址 | 不指定源地址 |
+
+`directSourceIp` 将直连用户流量和上游 DNS 查询绑定到该源 IPv4 地址；对等节点连接和
+REALITY 掩护流量不受影响。设置此字段时，`dns.servers` 必须显式列出数字 IPv4 地址
+（可带端口）；`system`、主机名和 IPv6 上游服务器无法保证源地址绑定，`check` 会拒绝。
 
 ## Log
 

@@ -85,12 +85,36 @@ impl ManagementSocket {
                 "management socket must be absolute",
             ));
         }
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "management socket has no parent",
+            )
+        })?;
+        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.file_type().is_symlink()
+            || parent_metadata.permissions().mode() & 0o077 != 0
+            || std::fs::canonicalize(parent)?.as_path() != parent
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "management socket parent must be a private canonical directory",
+            ));
+        }
         let listener = UnixListener::bind(path)?;
         if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             let _ = std::fs::remove_file(path);
             return Err(error);
         }
         let metadata = std::fs::metadata(path)?;
+        if metadata.uid() != parent_metadata.uid() {
+            let _ = std::fs::remove_file(path);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "management socket parent and socket must have the same owner",
+            ));
+        }
         let mut control_name = path.as_os_str().to_os_string();
         control_name.push(".control");
         let control_path = PathBuf::from(control_name);
@@ -206,14 +230,33 @@ impl Drop for ManagementSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    fn private_socket_path(suffix: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-reality-management-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir.join("management.sock")
+    }
+
+    #[test]
+    fn management_socket_rejects_non_private_parent() {
+        let path = private_socket_path(19);
+        let parent = path.parent().unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            ManagementSocket::bind(&path).err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!path.exists());
+        std::fs::remove_dir(parent).unwrap();
+    }
 
     #[tokio::test]
     async fn private_socket_reports_one_cumulative_snapshot() {
-        let path = std::env::temp_dir().join(format!(
-            "rust-reality-management-{}-{}.sock",
-            std::process::id(),
-            17
-        ));
+        let path = private_socket_path(17);
         let socket = ManagementSocket::bind(&path).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -243,15 +286,12 @@ mod tests {
         let _ = service.await;
         assert!(!path.exists());
         assert!(!PathBuf::from(format!("{}.control", path.display())).exists());
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
     async fn drop_users_command_cancels_only_matching_active_session() {
-        let path = std::env::temp_dir().join(format!(
-            "rust-reality-revoke-{}-{}.sock",
-            std::process::id(),
-            18
-        ));
+        let path = private_socket_path(18);
         let socket = ManagementSocket::bind(&path).unwrap();
         let revoker = SessionRevoker::default();
         // The process registry is populated by a compiled config generation.
@@ -288,5 +328,6 @@ mod tests {
         );
         service.abort();
         let _ = service.await;
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 }

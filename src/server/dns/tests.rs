@@ -18,10 +18,34 @@ use hickory_resolver::{
 
 use super::{
     DnsBackend, DnsCacheConfig, DnsError, DnsResolver, DnsServerSpec, IpFamily, UpstreamAnswer,
-    UpstreamError, classify_net_error, parse_server_spec,
+    UpstreamError, classify_net_error, name_server_config_with_source, parse_server_spec,
 };
+use crate::config::node::dns::DnsConfig;
 use crate::runtime::ResourceGovernor;
 use crate::runtime::policy::ResourceGovernorPolicy;
+
+#[test]
+fn dual_ip_dns_requires_literal_ipv4_and_binds_udp_and_tcp() {
+    let source = Ipv4Addr::new(198, 51, 100, 2);
+    let target = "1.1.1.1:53".parse().expect("numeric DNS server");
+    let server = name_server_config_with_source(target, Some(source));
+    assert_eq!(server.connections.len(), 2);
+    for connection in &server.connections {
+        assert_eq!(connection.bind_addr, Some((source, 0).into()));
+    }
+    let governor = || ResourceGovernor::new(&ResourceGovernorPolicy::default());
+    for servers in [
+        vec!["system".to_owned()],
+        vec!["dns.example.test".to_owned()],
+        vec!["[2001:4860:4860::8888]:53".to_owned()],
+    ] {
+        let config = DnsConfig {
+            servers: Some(servers),
+            ..DnsConfig::default()
+        };
+        assert!(DnsResolver::from_config_with_source(&config, governor(), Some(source)).is_err());
+    }
+}
 
 #[test]
 fn classify_net_error_preserves_timeout_and_protocol_failures() {

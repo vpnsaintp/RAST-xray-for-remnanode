@@ -35,7 +35,7 @@ use std::{
     error::Error,
     fmt,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, OnceLock, PoisonError,
@@ -512,6 +512,17 @@ impl DnsResolver {
         config: &DnsConfig,
         governor: ResourceGovernor,
     ) -> Result<Self, DnsResolverConfigError> {
+        Self::from_config_with_source(config, governor, None)
+    }
+
+    /// In direct dual-IP mode, every upstream DNS socket must use the same
+    /// source IPv4 as direct user traffic. System DNS and hostname bootstrap
+    /// cannot guarantee that, so they are rejected before the server starts.
+    pub fn from_config_with_source(
+        config: &DnsConfig,
+        governor: ResourceGovernor,
+        source_ip: Option<Ipv4Addr>,
+    ) -> Result<Self, DnsResolverConfigError> {
         let timeout = Duration::from_millis(config.timeout_ms());
         let cache = config.cache.unwrap_or_default();
         let configured = config.servers();
@@ -521,13 +532,24 @@ impl DnsResolver {
                 .map_err(|reason| DnsResolverConfigError::InvalidServer { index, reason })?
             {
                 DnsServerSpec::System => {
+                    if source_ip.is_some() {
+                        return Err(DnsResolverConfigError::SourceNeedsNumericDns);
+                    }
                     if configured.len() > 1 {
                         return Err(DnsResolverConfigError::MixedSystem);
                     }
                     return Ok(Self::system(governor, timeout, &cache));
                 }
-                DnsServerSpec::Address(address) => servers.push(name_server_config(address)),
+                DnsServerSpec::Address(address) => {
+                    if source_ip.is_some() && !address.is_ipv4() {
+                        return Err(DnsResolverConfigError::SourceNeedsNumericDns);
+                    }
+                    servers.push(name_server_config_with_source(address, source_ip));
+                }
                 DnsServerSpec::Host { host, port } => {
+                    if source_ip.is_some() {
+                        return Err(DnsResolverConfigError::SourceNeedsNumericDns);
+                    }
                     let bootstrapped = bootstrap_host(&host).map_err(|reason| {
                         DnsResolverConfigError::Bootstrap {
                             host: host.clone(),
@@ -982,6 +1004,8 @@ pub enum DnsResolverConfigError {
     },
     /// The DNS protocol backend failed to initialize.
     Backend(String),
+    /// Explicit direct source requires numeric IPv4 DNS servers.
+    SourceNeedsNumericDns,
 }
 
 impl fmt::Display for DnsResolverConfigError {
@@ -999,6 +1023,9 @@ impl fmt::Display for DnsResolverConfigError {
                 "dns.servers hostname {host:?} failed bootstrap resolution: {reason}"
             ),
             Self::Backend(reason) => write!(formatter, "DNS resolver backend failed: {reason}"),
+            Self::SourceNeedsNumericDns => formatter.write_str(
+                "network.directSourceIp requires numeric IPv4 dns.servers; system, hostname, and IPv6 servers cannot guarantee source binding",
+            ),
         }
     }
 }
@@ -1026,10 +1053,22 @@ fn bootstrap_host(host: &str) -> Result<Vec<IpAddr>, String> {
 }
 
 fn name_server_config(address: SocketAddr) -> NameServerConfig {
+    name_server_config_with_source(address, None)
+}
+
+fn name_server_config_with_source(
+    address: SocketAddr,
+    source_ip: Option<Ipv4Addr>,
+) -> NameServerConfig {
     let mut udp = ConnectionConfig::udp();
     udp.port = address.port();
     let mut tcp = ConnectionConfig::tcp();
     tcp.port = address.port();
+    if let Some(source_ip) = source_ip {
+        let bind = Some(SocketAddr::new(IpAddr::V4(source_ip), 0));
+        udp.bind_addr = bind;
+        tcp.bind_addr = bind;
+    }
     NameServerConfig::new(address.ip(), true, vec![udp, tcp])
 }
 

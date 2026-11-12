@@ -12,6 +12,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 /// Process-wide dialing behaviour.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
@@ -22,6 +23,10 @@ pub struct NetworkConfig {
     /// Absent means [`DialPolicy::Auto`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<DialPolicy>,
+    /// Required source address for user traffic routed to the built-in direct
+    /// outbound. Peer connections and REALITY cover traffic are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_source_ip: Option<Ipv4Addr>,
 }
 
 impl NetworkConfig {
@@ -88,6 +93,7 @@ impl DialPolicy {
 #[cfg(test)]
 mod tests {
     use super::{DialPolicy, NetworkConfig};
+    use std::net::Ipv4Addr;
 
     #[test]
     fn an_empty_network_block_dials_both_families() {
@@ -105,6 +111,20 @@ mod tests {
 
         assert!(!v6.ip().allows_ipv4() && v6.ip().allows_ipv6());
         assert_eq!(v6.ip().prefers_ipv4(), Some(false));
+    }
+
+    #[test]
+    fn direct_source_ip_is_explicit_and_ipv4_only() {
+        let network: NetworkConfig =
+            serde_json::from_str(r#"{"ip":"ipv4Only","directSourceIp":"198.51.100.2"}"#)
+                .expect("parse required egress IPv4");
+        assert_eq!(
+            network.direct_source_ip,
+            Some(Ipv4Addr::new(198, 51, 100, 2))
+        );
+        assert!(
+            serde_json::from_str::<NetworkConfig>(r#"{"directSourceIp":"2001:db8::2"}"#,).is_err()
+        );
     }
 
     #[test]

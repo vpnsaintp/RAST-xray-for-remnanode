@@ -1,0 +1,23 @@
+# Evidence-only server wrapper for Idle vs Observed telemetry measurement.
+# Not a product binary. Not shipped. Not a control-plane endpoint.
+[package]
+name = "rr-evidence-observe-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Evidence harness: ProductionServer + optional 1 Hz TransportTelemetry::snapshot"
+
+[[bin]]
+name = "rr-evidence-observe-server"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.5", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+rust-reality = { path = "../.." }
+tokio = { version = "1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

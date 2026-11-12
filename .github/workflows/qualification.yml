@@ -1,0 +1,1031 @@
+name: Native qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/qualification.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/**'
+      - 'crates/**'
+      - 'tools/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+# Unexpected descriptors in the candidate still fail closed. Production retains
+# intentional supervisor/configuration FD passing. Actions shell is bash-native
+# (ADR 0044); product FD ownership is asserted by qualification, not Python close_fds.
+defaults:
+  run:
+    # Bash-native Actions shell (ADR 0044): no Python, no KeyboardInterrupt stacks.
+    # Typed local twin: `cargo-dev ci gha-shell`. No github.* context in this field.
+    shell: bash --noprofile --norc -e -o pipefail {0}
+
+concurrency:
+  group: native-qualification-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    name: Exact-head native qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out the exact proposed source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare isolated evidence paths and native tools
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test -z "$(git status --porcelain)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential perl libtext-template-perl binutils curl ca-certificates \
+            tar gzip unzip util-linux iproute2 iputils-ping
+          mkdir -p "$RUNNER_TEMP/qualification" "$RUNNER_TEMP/rr-runtime" "$RUNNER_TEMP/rr-cache"
+          echo "Q=$RUNNER_TEMP/qualification" >> "$GITHUB_ENV"
+          echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/rr-runtime" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$RUNNER_TEMP/rr-cache" >> "$GITHUB_ENV"
+          rustup toolchain install
+      - name: Install nextest
+        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2.77.5
+        with:
+          tool: cargo-nextest@0.9.140
+      - name: Install dependency policy tool
+        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2.77.5
+        with:
+          tool: cargo-deny@0.19.4
+      - name: Install RustSec audit
+        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2.77.5
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Full authoritative gate on this exact head
+        timeout-minutes: 45
+        run: cargo dev check --all
+      - name: Build content-verified external fixtures
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rr-fixtures/xray"
+          cd "$RUNNER_TEMP/rr-fixtures"
+          mapfile -t stock_xray < <(python3 - "$GITHUB_WORKSPACE/tools/fixtures/stock-xray.json" <<'PYXRAY'
+          import json, sys
+          reference = json.load(open(sys.argv[1]))
+          values = [reference[key] for key in ('version', 'archiveUrl', 'archiveSha256', 'binarySha256', 'sourceCommit')]
+          assert all(isinstance(value, str) and '\n' not in value for value in values)
+          print('\n'.join(values))
+          PYXRAY
+          )
+          [[ "${#stock_xray[@]}" == 5 ]]
+          printf 'XRAY_REFERENCE_VERSION=%s\n' "${stock_xray[0]}" >> "$GITHUB_ENV"
+          curl --fail --location --retry 3 --max-time 180 \
+            "${stock_xray[1]}" -o xray.zip
+          printf '%s  xray.zip\n' "${stock_xray[2]}" | sha256sum --check -
+          unzip -q xray.zip xray LICENSE -d xray
+          printf '%s  xray/xray\n' "${stock_xray[3]}" | sha256sum --check -
+          chmod +x xray/xray
+          xray/xray version > xray/version.txt
+          grep -F "Xray ${stock_xray[0]} " xray/version.txt
+          grep -F "${stock_xray[4]:0:7}" xray/version.txt
+          curl --fail --location --retry 3 --max-time 180 \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.6/openssl-3.5.6.tar.gz -o openssl.tar.gz
+          echo 'deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736  openssl.tar.gz' | sha256sum --check -
+          tar -xzf openssl.tar.gz
+          cd openssl-3.5.6
+          ./Configure --prefix="$RUNNER_TEMP/rr-fixtures/openssl" \
+            --openssldir="$RUNNER_TEMP/rr-fixtures/openssl/ssl" no-shared no-tests enable-ssl-trace
+          make -j2
+          make install_sw install_ssldirs
+          echo "XRAY_BIN=$RUNNER_TEMP/rr-fixtures/xray/xray" >> "$GITHUB_ENV"
+          echo "OPENSSL_BIN=$RUNNER_TEMP/rr-fixtures/openssl/bin/openssl" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/rr-fixtures/openssl/bin" >> "$GITHUB_PATH"
+      - name: Verify TLS KeyUpdate with the pinned OpenSSL peer
+        run: |
+          cargo test --lib --locked openssl_interop -- --ignored --nocapture
+          cargo test --lib --locked --no-default-features openssl_interop -- --ignored --nocapture
+      - name: Freeze one release candidate and record identities
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo dev perf freeze --commit "$HEAD_SHA" --out-dir "$Q/frozen"
+          echo "RUST_BIN=$Q/frozen/binary/rust-reality" >> "$GITHUB_ENV"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'image=%s\nimage_version=%s\n' "$ImageOS" "$ImageVersion"
+            rustc -Vv
+            cargo --version
+            cc --version
+            uname -a
+            "$XRAY_BIN" version
+            "$OPENSSL_BIN" version -a
+            sha256sum "$XRAY_BIN" "$OPENSSL_BIN" tools/target/debug/rr-dev Cargo.lock tools/Cargo.lock
+          } > "$Q/identities.txt"
+      - name: Unified client live-process E2E (SOCKS5, HTTP CONNECT, multi-LINE)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # Exact-head source live processes (entry + client + origin). Same SHA
+          # as the frozen candidate; exercises Role::Client end-to-end.
+          cargo test --locked --test client_socks5_e2e --test client_http_connect_e2e --test client_multi_line_e2e -- --nocapture
+      - name: Unified client live-process E2E (SOCKS5 UDP ASSOCIATE / XUDP)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # PR7 six-cell matrix: rust×Direct cell receipt (no silent SKIP).
+          mkdir -p "$Q/rust-direct-xudp"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=rust-client-direct-xudp\n'
+            printf 'cell=rust/direct\n'
+          } | tee "$Q/rust-direct-xudp/identity.txt"
+          LOG="$Q/rust-direct-xudp/cargo-test.log"
+          cargo test --locked --test client_socks5_udp_e2e -- --nocapture 2>&1 | tee "$LOG"
+          if ! grep -E 'test result: ok\.' "$LOG"; then
+            printf '%s\n' 'FAIL: rust×Direct XUDP cell did not report ok' >&2
+            exit 1
+          fi
+          if grep -E 'test result:.*[^0-9]0 passed' "$LOG"; then
+            printf '%s\n' 'FAIL: rust×Direct XUDP cell passed zero cases' >&2
+            exit 1
+          fi
+          {
+            printf 'verdict=PASS\n'
+            printf 'cell=rust/direct\n'
+            grep -E 'test result:| PASS' "$LOG" | tail -n40
+          } | tee "$Q/rust-direct-xudp/receipt.txt"
+      - name: NXR XUDP process E2E (echo, multi-dest, Block, teardown)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # ADR 0060 / #314 PR3: Vision XUDP → NXR LANDING (LANDING on 127.0.0.2).
+          mkdir -p "$Q/nxr-xudp-e2e"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=nxr-xudp-process-e2e\n'
+          } | tee "$Q/nxr-xudp-e2e/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/nxr-xudp-e2e/cargo-test.log"
+          cargo test --locked --test xudp_nxr_e2e -- --nocapture 2>&1 | tee "$LOG"
+          grep -F 'landing_udp_sender_proof' "$LOG" | tee -a "$Q/nxr-xudp-e2e/receipt.txt"
+          grep -E 'test result: ok\.' "$LOG" | tee -a "$Q/nxr-xudp-e2e/receipt.txt"
+      - name: Handoff XUDP process E2E (echo, multi-dest, Block)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # ADR 0060 / #314 PR6: Vision XUDP → Handoff LANDING (LANDING on 127.0.0.2).
+          mkdir -p "$Q/handoff-xudp-e2e"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=handoff-xudp-process-e2e\n'
+          } | tee "$Q/handoff-xudp-e2e/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/handoff-xudp-e2e/cargo-test.log"
+          cargo test --locked --test xudp_handoff_e2e -- --nocapture 2>&1 | tee "$LOG"
+          grep -F 'landing_udp_sender_proof' "$LOG" | tee -a "$Q/handoff-xudp-e2e/receipt.txt"
+          grep -E 'test result: ok\.' "$LOG" | tee -a "$Q/handoff-xudp-e2e/receipt.txt"
+      - name: Mandatory stock Xray Client to rust-reality Server XUDP
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # ADR 0059 / AGENTS.md §6: unmodified stock Xray Client → rust-reality
+          # Server XUDP is a release gate. Missing fixture MUST fail closed.
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          mkdir -p "$Q/stock-xray-xudp"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'xray_pin=XTLS/Xray-core v%s linux-64\n' "$XRAY_REFERENCE_VERSION"
+            printf 'xray_zip_sha256=e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214\n'
+            printf 'test=stock_xray_client_udp_echo_via_rust_reality_entry\n'
+            printf 'gate=mandatory-xray-client-to-rust-reality-xudp\n'
+            "$XRAY_BIN" version
+            sha256sum "$XRAY_BIN"
+          } | tee "$Q/stock-xray-xudp/identity.txt"
+          # Cover peer for REALITY uses openssl on PATH (runner image) or OPENSSL_BIN.
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/stock-xray-xudp/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_stock_xray_interop \
+            stock_xray_client_udp_echo_via_rust_reality_entry \
+            -- --exact --nocapture --ignored 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -E 'skip: XRAY_BIN' "$LOG"; then
+            printf '%s\n' 'FAIL: mandatory stock Xray XUDP test skipped despite fixture' >&2
+            exit 1
+          fi
+          if grep -E 'running 0 tests' "$LOG"; then
+            printf '%s\n' 'FAIL: mandatory stock Xray XUDP gate matched zero tests' >&2
+            exit 1
+          fi
+          if ! grep -F 'test stock_xray_client_udp_echo_via_rust_reality_entry ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: mandatory stock Xray XUDP test did not report ok' >&2
+            exit 1
+          fi
+          if ! grep -E 'test result: ok\. 1 passed; 0 failed; .* ignored' "$LOG"; then
+            printf '%s\n' 'FAIL: expected exactly 1 passed for stock Xray XUDP gate' >&2
+            exit 1
+          fi
+          # Must never pull the historical rust-reality → Xray Server probe.
+          if grep -F 'rust_reality_client_udp_echo_via_stock_xray_server' "$LOG" | grep -v '^ignore'; then
+            if grep -E 'test rust_reality_client_udp_echo_via_stock_xray_server \.\.\.' "$LOG"; then
+              printf '%s\n' 'FAIL: non-required rust→Xray Server test was executed' >&2
+              exit 1
+            fi
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            printf 'status=%s\n' "$status"
+            grep -E 'test result:' "$LOG" | tail -n1
+            grep -F 'xudp_udp_rtt_ms' "$LOG" || true
+          } | tee "$Q/stock-xray-xudp/receipt.txt"
+      - name: Mandatory stock Xray Client to rust-reality NXR LANDING XUDP
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          mkdir -p "$Q/stock-xray-nxr-xudp"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-xray-client-to-rust-reality-nxr-xudp\n'
+            printf 'test=stock_xray_client_nxr_udp_echo_landing_is_sender\n'
+          } | tee "$Q/stock-xray-nxr-xudp/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/stock-xray-nxr-xudp/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_nxr_e2e \
+            stock_xray_client_nxr_udp_echo_landing_is_sender \
+            -- --exact --nocapture --ignored 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -E 'skip: XRAY_BIN|XRAY_BIN unset' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray NXR XUDP skipped despite fixture' >&2
+            exit 1
+          fi
+          if ! grep -F 'test stock_xray_client_nxr_udp_echo_landing_is_sender ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray NXR XUDP test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|landing_udp_sender_proof' "$LOG" | tail -n20
+          } | tee "$Q/stock-xray-nxr-xudp/receipt.txt"
+      - name: Mandatory stock Xray Client to rust-reality Handoff LANDING XUDP
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          mkdir -p "$Q/stock-xray-handoff-xudp"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-xray-client-to-rust-reality-handoff-xudp\n'
+            printf 'test=stock_xray_client_handoff_udp_echo_landing_is_sender\n'
+          } | tee "$Q/stock-xray-handoff-xudp/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/stock-xray-handoff-xudp/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_handoff_e2e \
+            stock_xray_client_handoff_udp_echo_landing_is_sender \
+            -- --exact --nocapture --ignored 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -E 'skip: XRAY_BIN|XRAY_BIN unset' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray Handoff XUDP skipped despite fixture' >&2
+            exit 1
+          fi
+          if ! grep -F 'test stock_xray_client_handoff_udp_echo_landing_is_sender ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray Handoff XUDP test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          # ADR 0069: the reported routing shape (geoip:private / GeoSite
+          # rules, multi-destination, DNS, STUN, large datagrams) over the
+          # native Handoff UDP channel.
+          set +e
+          cargo test --locked --test xudp_handoff_e2e \
+            stock_xray_handoff_native_udp_user_routing_shape \
+            -- --exact --nocapture --ignored 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -F 'test stock_xray_handoff_native_udp_user_routing_shape ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray Handoff native UDP routing-shape test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          # Field bug after v2.4.0: domain UDP after IP literals on one
+          # association, AAAA-first resolution, Direct and Handoff users.
+          set +e
+          cargo test --locked --test xudp_handoff_e2e \
+            stock_xray_dual_stack_domain_udp_after_ip_literals_direct_and_handoff \
+            -- --exact --nocapture --ignored 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -F 'test stock_xray_dual_stack_domain_udp_after_ip_literals_direct_and_handoff ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray dual-stack domain UDP test did not report ok' >&2
+            exit 1
+          fi
+          if grep -F 'skip: no IPv6 loopback' "$LOG"; then
+            printf '%s\n' 'FAIL: dual-stack domain UDP test skipped (no IPv6 loopback on runner)' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|landing_udp_sender_proof|routing_shape PASS|dual_stack_domain_udp PASS' "$LOG" | tail -n20
+          } | tee "$Q/stock-xray-handoff-xudp/receipt.txt"
+      - name: Mandatory stock Xray Client to rust-reality NXR LANDING TCP Vision
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          mkdir -p "$Q/stock-xray-nxr-tcp-vision"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-xray-client-to-rust-reality-nxr-tcp-vision\n'
+            printf 'test=stock_xray_client_nxr_tcp_vision_landing_is_sender\n'
+          } | tee "$Q/stock-xray-nxr-tcp-vision/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/stock-xray-nxr-tcp-vision/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_nxr_e2e \
+            stock_xray_client_nxr_tcp_vision_landing_is_sender \
+            -- --exact --nocapture --ignored 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -E 'skip: XRAY_BIN|XRAY_BIN unset' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray NXR TCP Vision skipped despite fixture' >&2
+            exit 1
+          fi
+          if ! grep -F 'test stock_xray_client_nxr_tcp_vision_landing_is_sender ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray NXR TCP Vision test did not report ok' >&2
+            exit 1
+          fi
+          if ! grep -F 'landing_tcp_sender_proof' "$LOG"; then
+            printf '%s\n' 'FAIL: missing LANDING TCP sender proof for stock Xray NXR Vision' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|landing_tcp_sender_proof' "$LOG" | tail -n20
+          } | tee "$Q/stock-xray-nxr-tcp-vision/receipt.txt"
+      - name: Mandatory stock Xray Client to rust-reality Handoff LANDING TCP Vision
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          mkdir -p "$Q/stock-xray-handoff-tcp-vision"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-xray-client-to-rust-reality-handoff-tcp-vision\n'
+            printf 'test=stock_xray_client_handoff_tcp_vision_landing_is_sender\n'
+          } | tee "$Q/stock-xray-handoff-tcp-vision/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/stock-xray-handoff-tcp-vision/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_handoff_e2e \
+            stock_xray_client_handoff_tcp_vision_landing_is_sender \
+            -- --exact --nocapture --ignored 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -E 'skip: XRAY_BIN|XRAY_BIN unset' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray Handoff TCP Vision skipped despite fixture' >&2
+            exit 1
+          fi
+          if ! grep -F 'test stock_xray_client_handoff_tcp_vision_landing_is_sender ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray Handoff TCP Vision test did not report ok' >&2
+            exit 1
+          fi
+          if ! grep -F 'landing_tcp_sender_proof' "$LOG"; then
+            printf '%s\n' 'FAIL: missing LANDING TCP sender proof for stock Xray Handoff Vision' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|landing_tcp_sender_proof' "$LOG" | tail -n20
+          } | tee "$Q/stock-xray-handoff-tcp-vision/receipt.txt"
+      - name: Mandatory rust-to-rust UDP/443 and genuine HTTP/3 over XUDP
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # AGENTS.md §6 / ADR 0059: UDP/443 + genuine HTTP/3 via XUDP are
+          # release gates. Unprivileged bind skip MUST fail closed.
+          mkdir -p "$Q/quic-h3-udp443"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-rust-udp443-http3-xudp\n'
+            printf 'require=CAP_NET_BIND_SERVICE on test binary\n'
+          } | tee "$Q/quic-h3-udp443/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          sudo apt-get install -y --no-install-recommends libcap2-bin >/dev/null
+          cargo test --locked --test quic_h3_udp443_e2e --no-run
+          mapfile -t BINS < <(find target/debug/deps -maxdepth 1 -type f -name 'quic_h3_udp443_e2e-*' ! -name '*.d' | sort)
+          test "${#BINS[@]}" -ge 1
+          BIN="${BINS[-1]}"
+          test -x "$BIN"
+          sudo setcap 'cap_net_bind_service=+ep' "$BIN"
+          getcap "$BIN" | tee -a "$Q/quic-h3-udp443/identity.txt"
+          export RR_REQUIRE_UDP443=1
+          LOG="$Q/quic-h3-udp443/cargo-test.log"
+          : > "$LOG"
+          # Invoke the capability-bearing binary directly — a fresh
+          # `cargo test` rebuild would drop setcap.
+          run_one() {
+            local name="$1"
+            set +e
+            "$BIN" --exact "$name" --nocapture --ignored 2>&1 | tee -a "$LOG"
+            local status=${PIPESTATUS[0]}
+            set -e
+            if ! grep -F "test $name ... ok" "$LOG"; then
+              printf '%s\n' "FAIL: mandatory UDP/443 gate test $name did not report ok" >&2
+              exit 1
+            fi
+            test "$status" -eq 0
+          }
+          run_one udp443_echo_via_xudp_with_allow_udp443
+          run_one udp443_rejected_without_allow_udp443_before_destination
+          run_one genuine_http3_over_xudp_udp443_no_tcp_fallback
+          run_one genuine_http3_over_nxr_xudp_udp443_no_tcp_fallback
+          run_one genuine_http3_over_handoff_xudp_udp443_no_tcp_fallback
+          # allowUdp443 via NXR/Handoff (echo + deny) lives in xudp_*_e2e; rebuild with setcap.
+          if grep -E 'skip: cannot bind 127.0.0.1:443' "$LOG"; then
+            printf '%s\n' 'FAIL: UDP/443 gate skipped privileged bind' >&2
+            exit 1
+          fi
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|genuine_http3|udp443_|ALPN|h3-origin handled' "$LOG" | tail -n40
+          } | tee "$Q/quic-h3-udp443/receipt.txt"
+      - name: Mandatory NXR UDP/443 policy and stock Xray NXR HTTP/3
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          mkdir -p "$Q/nxr-udp443-h3"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-nxr-udp443-policy-and-stock-h3\n'
+          } | tee "$Q/nxr-udp443-h3/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          sudo apt-get install -y --no-install-recommends libcap2-bin >/dev/null
+          export RR_REQUIRE_UDP443=1
+          # Prior UDP/443 gates can leave :443 busy briefly. Reclaim before
+          # binding again — silent skip is forbidden; fail closed if still busy.
+          # Probe MUST use sudo: unprivileged bind to :443 is EACCES, not EADDRINUSE.
+          ensure_udp443_free() {
+            local deadline=$((SECONDS + 30))
+            while (( SECONDS < deadline )); do
+              if sudo python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("127.0.0.1",443)); s.close(); s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.bind(("127.0.0.1",443)); s.close()'; then
+                printf '127.0.0.1:443 free\n'
+                return 0
+              fi
+              sudo fuser -k 443/udp 443/tcp 2>/dev/null || true
+              sleep 0.2
+            done
+            printf '%s\n' 'FAIL: 127.0.0.1:443 still busy after reclaim' >&2
+            ss -ulnp | head -n 40 || true
+            ss -tlnp | head -n 40 || true
+            return 1
+          }
+          ensure_udp443_free
+          LOG="$Q/nxr-udp443-h3/cargo-test.log"
+          : > "$LOG"
+          cargo test --locked --test xudp_nxr_e2e --no-run
+          mapfile -t BINS < <(find target/debug/deps -maxdepth 1 -type f -name 'xudp_nxr_e2e-*' ! -name '*.d' | sort)
+          test "${#BINS[@]}" -ge 1
+          BIN="${BINS[-1]}"
+          sudo setcap 'cap_net_bind_service=+ep' "$BIN"
+          set +e
+          "$BIN" --exact rust_client_nxr_udp443_allow_policy --nocapture --ignored 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -F 'test rust_client_nxr_udp443_allow_policy ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: NXR allowUdp443 policy test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          # Stock Xray NXR H3 uses the already setcap'd quic_h3 binary from prior step when present.
+          cargo test --locked --test quic_h3_udp443_e2e --no-run
+          mapfile -t HBINS < <(find target/debug/deps -maxdepth 1 -type f -name 'quic_h3_udp443_e2e-*' ! -name '*.d' | sort)
+          HBIN="${HBINS[-1]}"
+          sudo setcap 'cap_net_bind_service=+ep' "$HBIN"
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          set +e
+          "$HBIN" --exact stock_xray_client_nxr_genuine_http3_udp443 --nocapture --ignored 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -F 'test stock_xray_client_nxr_genuine_http3_udp443 ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray NXR H3 test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|PASS|peers=' "$LOG" | tail -n40
+          } | tee "$Q/nxr-udp443-h3/receipt.txt"
+      - name: Mandatory Handoff UDP/443 policy and stock Xray Handoff HTTP/3
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          mkdir -p "$Q/handoff-udp443-h3"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-handoff-udp443-policy-and-stock-h3\n'
+          } | tee "$Q/handoff-udp443-h3/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          sudo apt-get install -y --no-install-recommends libcap2-bin >/dev/null
+          export RR_REQUIRE_UDP443=1
+          # Prior UDP/443 gates can leave :443 busy briefly. Reclaim before
+          # binding again — silent skip is forbidden; fail closed if still busy.
+          # Probe MUST use sudo: unprivileged bind to :443 is EACCES, not EADDRINUSE.
+          ensure_udp443_free() {
+            local deadline=$((SECONDS + 30))
+            while (( SECONDS < deadline )); do
+              if sudo python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("127.0.0.1",443)); s.close(); s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.bind(("127.0.0.1",443)); s.close()'; then
+                printf '127.0.0.1:443 free\n'
+                return 0
+              fi
+              sudo fuser -k 443/udp 443/tcp 2>/dev/null || true
+              sleep 0.2
+            done
+            printf '%s\n' 'FAIL: 127.0.0.1:443 still busy after reclaim' >&2
+            ss -ulnp | head -n 40 || true
+            ss -tlnp | head -n 40 || true
+            return 1
+          }
+          ensure_udp443_free
+          LOG="$Q/handoff-udp443-h3/cargo-test.log"
+          : > "$LOG"
+          cargo test --locked --test xudp_handoff_e2e --no-run
+          mapfile -t BINS < <(find target/debug/deps -maxdepth 1 -type f -name 'xudp_handoff_e2e-*' ! -name '*.d' | sort)
+          test "${#BINS[@]}" -ge 1
+          BIN="${BINS[-1]}"
+          sudo setcap 'cap_net_bind_service=+ep' "$BIN"
+          set +e
+          "$BIN" --exact rust_client_handoff_udp443_allow_policy --nocapture --ignored 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -F 'test rust_client_handoff_udp443_allow_policy ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: Handoff allowUdp443 policy test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          cargo test --locked --test quic_h3_udp443_e2e --no-run
+          mapfile -t HBINS < <(find target/debug/deps -maxdepth 1 -type f -name 'quic_h3_udp443_e2e-*' ! -name '*.d' | sort)
+          HBIN="${HBINS[-1]}"
+          sudo setcap 'cap_net_bind_service=+ep' "$HBIN"
+          test -n "${XRAY_BIN:-}"
+          test -x "$XRAY_BIN"
+          set +e
+          "$HBIN" --exact stock_xray_client_handoff_genuine_http3_udp443 --nocapture --ignored 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -F 'test stock_xray_client_handoff_genuine_http3_udp443 ... ok' "$LOG"; then
+            printf '%s\n' 'FAIL: stock Xray Handoff H3 test did not report ok' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|PASS|peers=' "$LOG" | tail -n40
+          } | tee "$Q/handoff-udp443-h3/receipt.txt"
+      - name: Mandatory Handoff native UDP path MTU in a network namespace
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # ADR 0069: interface MTU drop mid-session (EMSGSIZE feedback,
+          # no loss) and genuine HTTP/3 (1200+ byte QUIC Initials) over a
+          # 1280-byte loopback, in throwaway network namespaces.
+          mkdir -p "$Q/handoff-udp-pmtu"
+          LOG="$Q/handoff-udp-pmtu/cargo-test.log"
+          : > "$LOG"
+          LIB=$(cargo test --locked --lib --no-run --message-format=json 2>/dev/null \
+            | python3 -c 'import json,sys
+          for line in sys.stdin:
+              m = json.loads(line)
+              if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "rust_reality":
+                  print(m["executable"])' | tail -n1)
+          test -x "$LIB"
+          T=server::handoff::udp::tests::netns_interface_mtu_drop_mid_session_repacketizes_without_loss
+          set +e
+          sudo env RR_NETNS_MTU_TESTS=1 unshare -n "$LIB" --exact "$T" --ignored --nocapture 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          grep -F "test $T ... ok" "$LOG"
+          test "$status" -eq 0
+          mapfile -t HBINS < <(find target/debug/deps -maxdepth 1 -type f -name 'quic_h3_udp443_e2e-*' ! -name '*.d' | sort)
+          HBIN="${HBINS[-1]}"
+          for t in genuine_http3_over_handoff_xudp_udp443_no_tcp_fallback stock_xray_client_handoff_genuine_http3_udp443; do
+            set +e
+            sudo env RR_REQUIRE_UDP443=1 XRAY_BIN="$XRAY_BIN" PATH="$PATH" unshare -n \
+              sh -c "ip link set lo up mtu 1280 && ip link show lo && '$HBIN' --exact $t --ignored --nocapture" 2>&1 | tee -a "$LOG"
+            status=${PIPESTATUS[0]}
+            set -e
+            grep -F "test $t ... ok" "$LOG"
+            test "$status" -eq 0
+          done
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:|PASS|mtu 1280' "$LOG" | tail -n20
+          } | tee "$Q/handoff-udp-pmtu/receipt.txt"
+      - name: Mandatory adversarial XUDP lifecycle and routing
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # FINAL MISSION Q3: rewrite security, GlobalID ownership/capacity,
+          # incomplete-frame progress, payload bounds, cancel/recovery,
+          # malformed + pressure, fail-detection demos. Fail closed.
+          mkdir -p "$Q/xudp-adversarial"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=mandatory-xudp-adversarial-lifecycle\n'
+            printf 'require=library process-level adversarial suite\n'
+          } | tee "$Q/xudp-adversarial/identity.txt"
+          LOG="$Q/xudp-adversarial/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_adversarial_lifecycle -- --nocapture 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -E 'test result: ok\.' "$LOG"; then
+            printf '%s\n' 'FAIL: adversarial XUDP suite did not report ok' >&2
+            exit 1
+          fi
+          # Fail closed on zero matched / ignored-as-pass patterns.
+          # Require a digit-bounded "0 passed" so "10 passed" does not match.
+          if grep -E 'test result:.*[^0-9]0 passed' "$LOG"; then
+            printf '%s\n' 'FAIL: adversarial XUDP suite passed zero cases' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            printf 'status=%s\n' "$status"
+            grep -E 'test result:| PASS$' "$LOG" | tail -n40
+          } | tee "$Q/xudp-adversarial/receipt.txt"
+      - name: UDP topology six-cell matrix (no silent SKIP)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # PR7 / #314: six client×topology cells must all have PASS receipts.
+          # Aggregation is fail-closed — missing receipt or SKIP token is FAIL.
+          mkdir -p "$Q/xudp-six-cell"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=udp-topology-six-cell-matrix\n'
+            printf 'cells=rust/direct,rust/nxr,rust/handoff,xray/direct,xray/nxr,xray/handoff\n'
+          } | tee "$Q/xudp-six-cell/identity.txt"
+          declare -a CELLS=(
+            "rust/direct|$Q/rust-direct-xudp/receipt.txt"
+            "rust/nxr|$Q/nxr-xudp-e2e/receipt.txt"
+            "rust/handoff|$Q/handoff-xudp-e2e/receipt.txt"
+            "xray/direct|$Q/stock-xray-xudp/receipt.txt"
+            "xray/nxr|$Q/stock-xray-nxr-xudp/receipt.txt"
+            "xray/handoff|$Q/stock-xray-handoff-xudp/receipt.txt"
+          )
+          : > "$Q/xudp-six-cell/receipt.txt"
+          for entry in "${CELLS[@]}"; do
+            cell="${entry%%|*}"
+            receipt="${entry#*|}"
+            if test ! -f "$receipt"; then
+              printf '%s\n' "FAIL: missing six-cell receipt for $cell ($receipt)" >&2
+              exit 1
+            fi
+            if grep -Eiq 'skip|ignored as pass|not run' "$receipt"; then
+              printf '%s\n' "FAIL: silent SKIP token in $cell receipt" >&2
+              cat "$receipt" >&2
+              exit 1
+            fi
+            if ! grep -Eiq 'verdict=PASS|test result: ok\.|landing_udp_sender_proof' "$receipt"; then
+              printf '%s\n' "FAIL: $cell receipt lacks PASS marker" >&2
+              cat "$receipt" >&2
+              exit 1
+            fi
+            printf 'cell=%s verdict=PASS receipt=%s\n' "$cell" "$receipt" \
+              | tee -a "$Q/xudp-six-cell/receipt.txt"
+          done
+          printf 'verdict=PASS\ncells=6\n' | tee -a "$Q/xudp-six-cell/receipt.txt"
+      - name: Constrained-resource NXR/Handoff UDP (descriptor bound)
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # PR7: ordinary six-cell already ran; this gate proves recovery under
+          # a tight RLIMIT_NOFILE (Frozen QEMU UDP constrained twin on Native).
+          mkdir -p "$Q/xudp-constrained"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=xudp-nxr-handoff-constrained-nofile\n'
+            printf 'ulimit_nofile=256\n'
+          } | tee "$Q/xudp-constrained/identity.txt"
+          LOG="$Q/xudp-constrained/cargo-test.log"
+          set +e
+          ( ulimit -n 256; cargo test --locked \
+              --test xudp_nxr_e2e --test xudp_handoff_e2e -- --nocapture ) \
+            2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -E 'test result: ok\.' "$LOG"; then
+            printf '%s\n' 'FAIL: constrained NXR/Handoff UDP did not report ok' >&2
+            exit 1
+          fi
+          if grep -Eiq 'skip|ignored as pass|not run' "$LOG"; then
+            printf '%s\n' 'FAIL: SKIP token under constrained UDP' >&2
+            exit 1
+          fi
+          if ! grep -F 'landing_udp_sender_proof' "$LOG"; then
+            printf '%s\n' 'FAIL: missing LANDING UDP sender proof under constrained' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            printf 'status=%s\n' "$status"
+            grep -E 'test result:|landing_udp_sender_proof' "$LOG" | tail -n40
+          } | tee "$Q/xudp-constrained/receipt.txt"
+      - name: TCP non-regression after XUDP gates
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # PR7: XUDP work must not regress TCP Vision client paths.
+          mkdir -p "$Q/tcp-non-regression"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=tcp-non-regression-after-xudp\n'
+          } | tee "$Q/tcp-non-regression/identity.txt"
+          LOG="$Q/tcp-non-regression/cargo-test.log"
+          cargo test --locked \
+            --test client_socks5_e2e --test client_http_connect_e2e --test client_multi_line_e2e \
+            -- --nocapture 2>&1 | tee "$LOG"
+          if ! grep -E 'test result: ok\.' "$LOG"; then
+            printf '%s\n' 'FAIL: TCP non-regression suite did not report ok' >&2
+            exit 1
+          fi
+          if grep -E 'test result:.*[^0-9]0 passed' "$LOG"; then
+            printf '%s\n' 'FAIL: TCP non-regression passed zero cases' >&2
+            exit 1
+          fi
+          {
+            printf 'verdict=PASS\n'
+            grep -E 'test result:' "$LOG" | tail -n20
+          } | tee "$Q/tcp-non-regression/receipt.txt"
+      - name: Quantitative UDP/XUDP loopback RTT (A/A noise)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # FINAL MISSION Q4: honest loopback RTT + A/A noise. Not a win claim.
+          mkdir -p "$Q/xudp-udp-perf"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=quantitative-xudp-udp-rtt-aa\n'
+            printf 'require=loopback RTT receipt; no universal speedup claim\n'
+          } | tee "$Q/xudp-udp-perf/identity.txt"
+          if ! command -v openssl >/dev/null 2>&1; then
+            test -n "${OPENSSL_BIN:-}"
+            test -x "$OPENSSL_BIN"
+            export PATH="$(dirname "$OPENSSL_BIN"):$PATH"
+          fi
+          LOG="$Q/xudp-udp-perf/cargo-test.log"
+          set +e
+          cargo test --locked --test xudp_udp_performance -- --nocapture 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[0]}
+          set -e
+          if ! grep -E 'test result: ok\.' "$LOG"; then
+            printf '%s\n' 'FAIL: UDP performance suite did not report ok' >&2
+            exit 1
+          fi
+          if grep -E 'test result:.*[^0-9]0 passed' "$LOG"; then
+            printf '%s\n' 'FAIL: UDP performance suite passed zero cases' >&2
+            exit 1
+          fi
+          if ! grep -F 'xudp_udp_rtt_aa' "$LOG"; then
+            printf '%s\n' 'FAIL: missing A/A RTT receipt line' >&2
+            exit 1
+          fi
+          test "$status" -eq 0
+          {
+            printf 'verdict=PASS\n'
+            printf 'status=%s\n' "$status"
+            grep -E 'test result:|xudp_udp_rtt' "$LOG" | tail -n40
+          } | tee "$Q/xudp-udp-perf/receipt.txt"
+      - name: Unmodified Xray REALITY and Vision interoperability
+        timeout-minutes: 5
+        run: |
+          cargo dev bench run --suite no-ccs-interop \
+            --rust-bin "$RUST_BIN" --xray-bin "$XRAY_BIN" --openssl-bin "$OPENSSL_BIN" \
+            --run-id "$GITHUB_RUN_ID-interop" --out-dir "$Q/interop"
+      - name: Warm and cold mechanism on owned temporary test networks
+        timeout-minutes: 350
+        # The native harness owns uniquely named netns/veth/qdiscs on this
+        # disposable hosted runner. It never contacts deployment hosts or
+        # changes a firewall, host sysctl, or production configuration.
+        run: |
+          cargo dev bench run --suite deployment --deployment-plan mechanism \
+            --rust-bin "$RUST_BIN" --xray-bin "$XRAY_BIN" \
+            --run-id "$GITHUB_RUN_ID-mechanism" --out-dir "$Q/mechanism"
+      - name: Child-only descriptor pressure and recovery
+        timeout-minutes: 5
+        run: |
+          cargo dev bench run --suite descriptor-pressure \
+            --rust-bin "$RUST_BIN" --xray-bin "$XRAY_BIN" --openssl-bin "$OPENSSL_BIN" \
+            --nofile-limit 192 --max-held-connections 96 --storm-connections 12 \
+            --run-id "$GITHUB_RUN_ID-pressure" --out-dir "$Q/pressure"
+      - name: Thirty-minute mixed-topology regression soak
+        timeout-minutes: 40
+        run: |
+          cargo dev bench run --suite soak --soak-implementation rust \
+            --rust-bin "$RUST_BIN" --xray-bin "$XRAY_BIN" --openssl-bin "$OPENSSL_BIN" \
+            --soak-seconds 1800 --soak-round-sleep-ms 5000 --soak-min-rounds 3 \
+            --soak-distributed-interval-seconds 1800 \
+            --run-id "$GITHUB_RUN_ID-soak" --out-dir "$Q/soak"
+      - name: Retain only public-safe evidence files
+        if: always()
+        env:
+          QUALIFICATION_STATUS: ${{ job.status }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'qualification'
+          public = pathlib.Path(os.environ['RUNNER_TEMP']) / 'qualification-public'
+          public.mkdir()
+          names = [
+              'identities.txt', 'frozen/freeze.json', 'frozen/SHA256SUMS',
+              'frozen/binary/rust-reality',
+              'stock-xray-xudp/identity.txt', 'stock-xray-xudp/receipt.txt',
+              'stock-xray-xudp/cargo-test.log',
+              'rust-direct-xudp/identity.txt', 'rust-direct-xudp/receipt.txt',
+              'rust-direct-xudp/cargo-test.log',
+              'nxr-xudp-e2e/identity.txt', 'nxr-xudp-e2e/receipt.txt',
+              'handoff-xudp-e2e/identity.txt', 'handoff-xudp-e2e/receipt.txt',
+              'stock-xray-nxr-xudp/identity.txt', 'stock-xray-nxr-xudp/receipt.txt',
+              'stock-xray-handoff-xudp/identity.txt', 'stock-xray-handoff-xudp/receipt.txt',
+              'stock-xray-nxr-tcp-vision/identity.txt', 'stock-xray-nxr-tcp-vision/receipt.txt',
+              'stock-xray-handoff-tcp-vision/identity.txt', 'stock-xray-handoff-tcp-vision/receipt.txt',
+              'nxr-udp443-h3/identity.txt', 'nxr-udp443-h3/receipt.txt',
+              'handoff-udp443-h3/identity.txt', 'handoff-udp443-h3/receipt.txt',
+              'quic-h3-udp443/identity.txt', 'quic-h3-udp443/receipt.txt',
+              'quic-h3-udp443/cargo-test.log',
+              'xudp-adversarial/identity.txt', 'xudp-adversarial/receipt.txt',
+              'xudp-adversarial/cargo-test.log',
+              'xudp-six-cell/identity.txt', 'xudp-six-cell/receipt.txt',
+              'xudp-constrained/identity.txt', 'xudp-constrained/receipt.txt',
+              'tcp-non-regression/identity.txt', 'tcp-non-regression/receipt.txt',
+              'xudp-udp-perf/identity.txt', 'xudp-udp-perf/receipt.txt',
+              'xudp-udp-perf/cargo-test.log',
+              'interop/summary.json', 'interop/environment.json', 'interop/completion.json',
+              'interop/certificate-san.txt',
+              'pressure/pressure-result.json', 'pressure/gate-summary.json',
+              'pressure/environment.json', 'pressure/completion.json',
+              'mechanism/plan.json', 'mechanism/environment.json', 'mechanism/summary.json',
+              'mechanism/summary-netem.json', 'mechanism/run-contract.json',
+              'mechanism/run-completion.json', 'mechanism/rtt/profiles.jsonl',
+              'mechanism/rtt/pool-summaries.json', 'mechanism/rtt/netstate.txt',
+              'soak/soak-summary.json', 'soak/environment.json', 'soak/completion.json',
+              'soak/resources.jsonl', 'soak/distributed-samples.jsonl',
+              'soak/distributed-gates.json', 'soak/handoff-cover-certificate-san.txt',
+              'soak/attempt-environment.json', 'soak/attempt-terminal.json',
+              'soak/execution-terminal.json',
+              'soak/native-resources.json',
+          ]
+          # Native ownership receipts contain the product's fixed secret-free
+          # event vocabulary and /proc observations, never generated configs.
+          names += [str(path.relative_to(root))
+                    for path in sorted((root / 'soak').glob('ownership-*.json'))]
+          names += [f'mechanism/setup-rtt{rtt}-loss0-{protocol}-{mode}.jsonl'
+                    for rtt in (50, 100, 200) for protocol in ('handoff', 'nxr', 'socks')
+                    for mode in ('warm', 'cold')]
+          retained, missing = [], []
+          for name in names:
+              src = root / name
+              if not src.exists():
+                  missing.append(name)
+                  continue
+              if src.is_symlink() or not src.is_file() or not src.resolve().is_relative_to(root.resolve()):
+                  raise SystemExit(f'non-regular or escaped evidence: {name}')
+              dst = public / name
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(src, dst)
+              retained.append(name)
+          status = os.environ['QUALIFICATION_STATUS']
+          manifest = {
+              'source_commit': os.environ['HEAD_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job_status_before_publication': status,
+              'retained': retained, 'missing': missing,
+              'scope': 'Exact-head local-runner regression, not a real-host canary or WAN claim.',
+              'excluded': 'Generated configurations, keys, payloads, standalone raw process logs and TLS traces.',
+              'retention_days': 30,
+          }
+          (public / 'PUBLICATION.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          records = []
+          for path in sorted(public.rglob('*')):
+              if path.is_file():
+                  digest = hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+                  records.append(f'{digest}  {path.relative_to(public)}\n')
+          (public / 'SHA256SUMS').write_text(''.join(records))
+          if status == 'success' and missing:
+              raise SystemExit('Successful qualification is missing required retained evidence')
+          PY
+      - name: Upload explicitly allowlisted evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-qualification-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/qualification-public/
+          if-no-files-found: error
+          retention-days: 30
+
+  long-lived-connections:
+    name: 600s connection matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out the exact proposed source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
+      - name: Run the ignored authenticated connection matrix
+        timeout-minutes: 20
+        run: >-
+          cargo test --lib --locked -- --color never --exact
+          server::vision::tests::authenticated_connections_survive_quiet_directions_for_600s
+          --ignored --test-threads=1

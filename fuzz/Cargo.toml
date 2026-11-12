@@ -1,0 +1,195 @@
+[package]
+name = "rust-reality-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
+libfuzzer-sys = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+rust-reality = { path = "..", features = ["fuzzing"] }
+rr-session = { path = "../crates/rr-session" }
+rr-fingerprint = { path = "../tools/rr-fingerprint" }
+
+[[bin]]
+name = "fingerprint_capture"
+path = "fuzz_targets/fingerprint_capture.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_parsers"
+path = "fuzz_targets/wire_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vision_decoder"
+path = "fuzz_targets/vision_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handoff_header"
+path = "fuzz_targets/handoff_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handoff_blob"
+path = "fuzz_targets/handoff_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handoff_open_transfer"
+path = "fuzz_targets/handoff_open_transfer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cover_flight"
+path = "fuzz_targets/cover_flight.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_json"
+path = "fuzz_targets/config_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "management_command"
+path = "fuzz_targets/management_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bittorrent_prefix"
+path = "fuzz_targets/bittorrent_prefix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_diagnostic"
+path = "fuzz_targets/config_diagnostic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vision_transitions"
+path = "fuzz_targets/vision_transitions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls13_record"
+path = "fuzz_targets/tls13_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handoff_round_trip"
+path = "fuzz_targets/handoff_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handoff_udp_packets"
+path = "fuzz_targets/handoff_udp_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nxr_round_trip"
+path = "fuzz_targets/nxr_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nxr_udp_frames"
+path = "fuzz_targets/nxr_udp_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transcript_diff"
+path = "fuzz_targets/transcript_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reality_auth_round_trip"
+path = "fuzz_targets/reality_auth_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_semantics"
+path = "fuzz_targets/session_semantics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_update"
+path = "fuzz_targets/key_update.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "nested_tls_prefix"
+path = "fuzz_targets/nested_tls_prefix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stability_evidence"
+path = "fuzz_targets/stability_evidence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p256_agreement"
+path = "fuzz_targets/p256_agreement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "browser_offer"
+path = "fuzz_targets/browser_offer.rs"
+test = false
+doc = false
+bench = false

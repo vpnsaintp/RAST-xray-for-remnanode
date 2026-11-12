@@ -1,0 +1,132 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR-scoped only: a later pull_request event cancels the superseded PR run.
+# push to main, schedule, and workflow_dispatch use github.run_id and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2.77.5
+        with:
+          tool: cargo-deny@0.19.4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2.77.5
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Enforce dependency sources, licenses, and advisories
+        run: |
+          cargo deny --all-features check bans licenses sources
+          cargo audit --deny warnings
+
+  fuzz:
+    name: Fuzz shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      FUZZ_SMOKE_SECONDS: ${{ github.event_name == 'schedule' && '120' || '8' }}
+      FUZZ_SMOKE_MAX_SECONDS: 120
+      FUZZ_OUTPUT_DIR: fuzz-output
+      FUZZ_TOOLCHAIN: nightly-2026-08-02
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly-2026-08-02
+      - name: Install cargo-fuzz
+        run: cargo +nightly-2026-08-02 install cargo-fuzz --version 0.13.2 --locked
+      - name: Run authoritative target shard
+        shell: bash
+        run: cargo dev fuzz smoke --shard-index "${{ matrix.shard }}" --shard-count 4
+      - name: Upload fuzz failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-shard-${{ matrix.shard }}
+          path: fuzz-output/
+          if-no-files-found: error
+          retention-days: 7
+
+  sanitizers:
+    name: Address and leak sanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --component rust-src
+      - name: Run address and leak checks
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          LSAN_OPTIONS: exitcode=23
+        run: >-
+          cargo +nightly test -Zbuild-std --workspace --all-features --locked
+          --target x86_64-unknown-linux-gnu
+
+  thread-sanitizer:
+    name: Replay and warm-transport race sanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --component rust-src
+      - name: Run concurrent replay test under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            protocol::reality::replay::tests::concurrent_duplicate_race_has_one_winner
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            server::handoff::tests -- --test-threads=1
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            server::nxr::tests -- --test-threads=1
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            server::outbound::tests -- --test-threads=1
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            server::pre_auth::tests -- --test-threads=1
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            server::warm_pool::tests -- --test-threads=1
+          cargo +nightly test -Zbuild-std --all-features --locked \
+            --target x86_64-unknown-linux-gnu \
+            server::vision::tests -- --test-threads=1

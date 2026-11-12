@@ -1,0 +1,24 @@
+nextest-version = "0.9.140"
+
+[profile.default]
+fail-fast = false
+retries = 0
+flaky-result = "fail"
+global-timeout = "5m"
+slow-timeout = { period = "10s", terminate-after = 2 }
+failure-output = "immediate-final"
+success-output = "never"
+
+[profile.ci]
+inherits = "default"
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "rust-reality"
+store-success-output = false
+store-failure-output = true
+
+# Process-level REALITY + openssl cover stacks need more than the default 10s×2.
+[[profile.default.overrides]]
+filter = 'binary(client_socks5_udp_e2e)'
+slow-timeout = { period = "60s", terminate-after = 2 }

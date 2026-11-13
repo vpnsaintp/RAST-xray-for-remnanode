@@ -1,0 +1,44 @@
+[package]
+name = "rr-linux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "The no_std Linux ABI boundary isolating raw kernel mechanisms from the rust-reality protocol crate"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+# `std` is the production composition. It forwards `rustix/std`, which makes
+# `rustix::fd::OwnedFd` *the same type* as `std::os::fd::OwnedFd`, so a bound
+# listening descriptor moves into std/Tokio without `unsafe` in the protocol
+# crate. It adds no mechanism and no code path: every function in this crate
+# compiles unchanged against `core` alone with `--no-default-features`.
+default = ["std"]
+std = ["rustix/std"]
+
+[dependencies]
+# Every kernel mechanism. `default-features = false` keeps `rustix/use-libc`
+# off, so on Linux rustix resolves its `linux_raw` backend over
+# `linux-raw-sys` and issues syscalls directly rather than through libc.
+rustix = { version = "1.1.6", default-features = false, features = ["fs", "net", "param", "pipe", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Compile-time ABI constant source only — `SOMAXCONN`, whose value is a
+# target-specific C library policy (4096 on GNU, 128 on musl) that neither
+# rustix nor linux-raw-sys exposes. `default-features = false` drops `libc/std`
+# and keeps this crate's dependency closure `no_std`; nothing in this crate
+# calls a libc function or mediates a syscall through libc.
+libc = { version = "0.2.180", default-features = false }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+allow_attributes_without_reason = "warn"
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"

@@ -1,0 +1,72 @@
+# Fuzzing
+
+Fuzz coverage is an attack-surface requirement, not decoration: every externally
+reachable parser, decoder, or reconstruction path must have a fuzz target or a
+recorded justification for the gap. See the threat model
+([English](../threat-model.md) | [简体中文](../../zh-CN/threat-model.md)) for the
+trust boundaries that make this a security discipline, and the
+[attack-surface map](../operations/fuzz-attack-surface.md) for the complete
+surface-to-target inventory with recorded gaps.
+
+## Targets
+
+Targets live in `fuzz/fuzz_targets/`, one `fuzz_target!` binary each. The
+manifest is validated by `cargo dev fuzz targets`; CI's Security workflow runs
+sharded smoke passes over all targets on every PR. The current set covers:
+
+- VLESS request decode/client encode round trips and response decode, REALITY
+  ClientHello record/message parse and extension walk, NXR header/decode round trips and NXR UDP frames (`wire_parsers`, `nxr_round_trip`, `nxr_udp_frames`);
+- Vision decoder single-shot, bounded client VLESS response reassembly, and fragmented transitions
+  (`vision_decoder`, `vision_transitions`);
+- Handoff header, blob, authenticated transfer open, and round trip
+  (`handoff_header`, `handoff_blob`, `handoff_open_transfer`, `handoff_round_trip`);
+- Handoff native UDP channel header/OPEN/DATA/FRAG parsing, seal/open round trip
+  with bitflip and replay rejection, and fragment reassembly (`handoff_udp_packets`);
+- cover ServerHello flight parsing (`cover_flight`);
+- TLS 1.3 record open/seal, post-handshake KeyUpdate reconstruction, and
+  transcript-hash differential (`tls13_record`, `key_update`, `transcript_diff`);
+- configuration JSON deserialization on the exact `load_config` decode path
+  (`config_json`, `config_diagnostic`);
+- local panel session-control command parsing (`management_command`);
+- first decrypted TCP BitTorrent handshake prefix across fragment boundaries
+  (`bittorrent_prefix`);
+- REALITY authentication round trip and session-engine semantics
+  (`reality_auth_round_trip`, `session_semantics`).
+
+- Strict stability evidence, required-check child execution, native interoperability/mechanism/descriptor-pressure, package execution/tier metadata, CI/full-gate/libtest and VM clock/kernel/startup/terminal/fault-action receipts, netem observations/state, product logs, origin upload receipts, fixed IPv4 SOCKS echo replies and offline ownership evaluation (`stability_evidence`); the target compiles the maintained tooling parser and evaluator directly, without linking tooling into the production binary.
+
+The independent browser capture decoder is covered by `fingerprint_capture`. It
+rejects malformed framing and lengths while preserving all observable wire bytes.
+`p256_agreement` exercises the TLS SEC1 share boundary and agreement with a
+fixed fuzz-only scalar, including invalid lengths, infinity and off-curve input.
+
+`nxr_udp_frames` exercises both the raw authenticated-frame decoder and the
+same bounded body parser directly through a test-only hook. This prevents MAC
+rejection from hiding malformed flags, addresses, and payload lengths from
+fuzzing; production parsing still verifies the MAC before decoding the body.
+
+## Commands
+
+```shell
+cargo dev fuzz targets              # validate the manifest; print targets (optionally sharded)
+cargo dev fuzz smoke                # deterministic short smoke pass over the targets
+```
+
+CI runs the smoke shards on every PR; longer local campaigns use cargo-fuzz
+directly (`cargo fuzz run <target>`) against `fuzz/`.
+
+## Rules
+
+- A new parser, decoder, or reconstruction path MUST ship with a fuzz target in
+  the same change (see [AGENTS.md](../../../AGENTS.md), fuzz engineering law).
+- Fuzz-only hooks must stay outside production behavior: production code must
+  not branch on fuzzing, and fuzz harnesses must not relax production invariants.
+- Structured round-trip targets (encode → decode equality, bitflip-must-fail)
+  are preferred where a legitimate producer exists; raw-input targets where the
+  bytes come from the network.
+
+The `nested_tls_prefix` target checks destination TLS header-prefix classification at every fragment boundary against the complete-header predicate. Async open-origin progress and pending-read cancellation are covered by socket regression tests.
+
+`browser_offer` exercises both production browser serializers with variable SNI
+input and independently decodes successful records. `fingerprint_capture` also
+exercises the structural comparison policy with malformed captures.

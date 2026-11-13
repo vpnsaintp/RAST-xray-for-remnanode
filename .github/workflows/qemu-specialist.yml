@@ -1,0 +1,819 @@
+name: QEMU specialist qualification
+
+# Independent-kernel/resource-profile qualification runs on a frozen review
+# candidate or an explicit operator dispatch, not every draft edit.
+# Four TCP contract cells run as an Actions matrix (ADR 0042): ordinary hosted
+# runners have one cell's non-overlapping vCPU budget, so same-host parallel
+# would oversubscribe constrained profiles. Merge remains fail-closed.
+# PR7 also runs a four-cell NXR/Handoff UDP matrix (ordinary+constrained) on the
+# same candidate SHA so Frozen acceptance proves UDP, not only TCP VM cells.
+on:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        required: true
+        type: string
+      package_artifact:
+        description: Native GNU package receipt artifact from this same workflow run
+        required: true
+        type: string
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Bash-native Actions shell (ADR 0044): no Python, no KeyboardInterrupt stacks.
+    # Typed local twin: `cargo-dev ci gha-shell`. No github.* context in this field.
+    shell: bash --noprofile --norc -e -o pipefail {0}
+
+concurrency:
+  group: qemu-specialist-${{ inputs.candidate_sha || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kvm-capability:
+    name: Hosted KVM capability (not qualification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe actual hosted QEMU acceleration
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kvm-capability"
+          exec > >(tee "$RUNNER_TEMP/kvm-capability/probe.log") 2>&1
+          uname -a
+          lscpu
+          test -c /dev/kvm
+          ls -l /dev/kvm
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+          qemu-system-x86_64 --version
+          # No disks, guest credentials, listeners, or host permission changes.
+          # Force KVM: unavailable acceleration must fail rather than use TCG.
+          printf 'info kvm\nquit\n' | sudo timeout 20s qemu-system-x86_64 \
+            -accel kvm -cpu host -m 128 -smp 1 -nodefaults \
+            -display none -serial none -monitor stdio -S \
+            | tee "$RUNNER_TEMP/kvm-capability/qemu.log"
+          grep -q 'kvm support: enabled' "$RUNNER_TEMP/kvm-capability/qemu.log"
+          echo 'KVM capability confirmed; no workload qualification performed.'
+      - name: Retain capability evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kvm-capability-${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/kvm-capability/
+          if-no-files-found: error
+          retention-days: 7
+
+  qemu-prepare:
+    name: Shared QEMU campaign inputs
+    needs: kvm-capability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      HEAD_SHA: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+      PACKAGE_ARTIFACT: ${{ inputs.package_artifact }}
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Restore the coordinator's native GNU package receipt
+        if: inputs.package_artifact != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.package_artifact }}
+          path: ${{ runner.temp }}/shared-gnu-package
+      - name: Build frozen controller and campaign binaries
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test -z "$(git status --porcelain)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates build-essential perl libtext-template-perl unzip
+          rustup toolchain install
+          RUST_REALITY_GIT_COMMIT="$HEAD_SHA" cargo build --locked --release --manifest-path tools/Cargo.toml -p rr-dev
+          mkdir -p "$RUNNER_TEMP/rr-qemu-prepare/bin" "$RUNNER_TEMP/rr-qemu-prepare/tools/xray" "$RUNNER_TEMP/rr-qemu-prepare/base"
+          cp "$GITHUB_WORKSPACE/tools/target/release/rr-dev" "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev"
+          chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev"
+          if [[ -n "$PACKAGE_ARTIFACT" ]]; then
+            python3 - <<'PYBIND'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'shared-gnu-package'
+          proof = json.loads((root/'receipt.json').read_text())
+          if (proof['schema'] != 'rr-package-execution/v1'
+              or proof['source_commit'] != os.environ['HEAD_SHA']
+              or proof['tier'] != 'linux-x86_64-generic'
+              or proof['primary_error'] is not None or proof['finalization_errors']
+              or proof['runner'] or proof['host_architecture'] != 'x86_64'
+              or len(proof['commands']) != 7
+              or any(c['exit_code'] != 0 or c['error'] is not None for c in proof['commands'])):
+              raise SystemExit('Native GNU package receipt is not acceptable')
+          binary = root/'rust-reality'
+          expected = proof['binary']
+          if (expected['path'] != 'rust-reality' or binary.is_symlink() or not binary.is_file()
+              or expected['before'] != expected['after']
+              or hashlib.file_digest(binary.open('rb'), 'sha256').hexdigest() != expected['before']):
+              raise SystemExit('GNU package executable identity mismatch')
+          dest = pathlib.Path(os.environ['RUNNER_TEMP'])/'rr-qemu-prepare'/'bin'/'rust-reality'
+          shutil.copy2(binary, dest)
+          dest.chmod(0o755)
+          PYBIND
+          else
+            RUST_REALITY_GIT_COMMIT="$HEAD_SHA" cargo build --locked --release
+            cp "$GITHUB_WORKSPACE/target/release/rust-reality" "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality"
+            chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality"
+          fi
+          cd "$RUNNER_TEMP/rr-qemu-prepare/tools"
+          mapfile -t stock_xray < <(python3 - "$GITHUB_WORKSPACE/tools/fixtures/stock-xray.json" <<'PYXRAY'
+          import json, sys
+          reference = json.load(open(sys.argv[1]))
+          values = [reference[key] for key in ('version', 'archiveUrl', 'archiveSha256', 'binarySha256', 'sourceCommit')]
+          assert all(isinstance(value, str) and '\n' not in value for value in values)
+          print('\n'.join(values))
+          PYXRAY
+          )
+          [[ "${#stock_xray[@]}" == 5 ]]
+          curl --fail --location --retry 3 --max-time 180 "${stock_xray[1]}" -o xray.zip
+          printf '%s  xray.zip\n' "${stock_xray[2]}" | sha256sum --check -
+          unzip -q xray.zip xray LICENSE -d xray
+          printf '%s  xray/xray\n' "${stock_xray[3]}" | sha256sum --check -
+          chmod +x xray/xray
+          xray/xray version > xray/version.txt
+          grep -F "Xray ${stock_xray[0]} " xray/version.txt
+          grep -F "${stock_xray[4]:0:7}" xray/version.txt
+          curl --fail --location --retry 3 --max-time 180 https://github.com/openssl/openssl/releases/download/openssl-3.5.6/openssl-3.5.6.tar.gz -o openssl.tar.gz
+          echo 'deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736  openssl.tar.gz' | sha256sum --check -
+          tar -xzf openssl.tar.gz
+          cd openssl-3.5.6
+          ./Configure --prefix="$RUNNER_TEMP/rr-qemu-prepare/tools/openssl" --openssldir="$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/ssl" no-shared no-tests enable-ssl-trace
+          make -j2
+          make install_sw install_ssldirs
+          cd "$RUNNER_TEMP/rr-qemu-prepare/base"
+          curl --fail --location --retry 3 --max-time 600 https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img -o base.qcow2
+          curl --fail --location --retry 3 --max-time 60 https://cloud-images.ubuntu.com/noble/current/SHA256SUMS -o SHA256SUMS.vendor
+          awk '$2 == "*noble-server-cloudimg-amd64.img" || $2 == "noble-server-cloudimg-amd64.img" {print $1 "  base.qcow2"}' SHA256SUMS.vendor > base.sha256
+          test "$(wc -l < base.sha256)" = 1
+          sha256sum --check base.sha256
+          python3 - <<'PYMETA'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])/'rr-qemu-prepare'
+          def digest(path):
+              return hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+          meta = {
+              'schema': 'rr-qemu-prepare/v1',
+              'source_commit': os.environ['HEAD_SHA'],
+              'rr_dev_sha256': digest(root/'bin'/'rr-dev'),
+              'candidate_sha256': digest(root/'bin'/'rust-reality'),
+              'xray_sha256': digest(root/'tools'/'xray'/'xray'),
+              'openssl_sha256': digest(root/'tools'/'openssl'/'bin'/'openssl'),
+              'base_sha256': digest(root/'base'/'base.qcow2'),
+          }
+          (root/'prepare-identity.json').write_text(json.dumps(meta, indent=2) + '\n')
+          print(json.dumps(meta, indent=2))
+          PYMETA
+      - name: Retain shared prepare inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-prepare-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/rr-qemu-prepare/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
+
+  qemu-cell:
+    name: QEMU cell ${{ matrix.cell }}
+    needs: [kvm-capability, qemu-prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cell: handoff/ordinary
+            slug: handoff-ordinary
+          - cell: nxr/ordinary
+            slug: nxr-ordinary
+          - cell: handoff/constrained
+            slug: handoff-constrained
+          - cell: nxr/constrained
+            slug: nxr-constrained
+    env:
+      HEAD_SHA: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+      MATRIX_CELL: ${{ matrix.cell }}
+      CELL_SLUG: ${{ matrix.slug }}
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Restore shared prepare inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hosted-qemu-prepare-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/rr-qemu-prepare
+      - name: Provision cell fixture and run one contract cell
+        timeout-minutes: 110
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test -z "$(git status --porcelain)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl ca-certificates
+          chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality"
+          chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/tools/xray/xray" "$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/bin/openssl"
+          python3 - <<'PYCHECK'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])/'rr-qemu-prepare'
+          meta = json.loads((root/'prepare-identity.json').read_text())
+          if meta['source_commit'] != os.environ['HEAD_SHA']:
+              raise SystemExit('prepare identity commit drift')
+          def digest(path):
+              return hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+          for rel, key in [('bin/rr-dev','rr_dev_sha256'),('bin/rust-reality','candidate_sha256'),('tools/xray/xray','xray_sha256'),('tools/openssl/bin/openssl','openssl_sha256'),('base/base.qcow2','base_sha256')]:
+              if digest(root/rel) != meta[key]:
+                  raise SystemExit('prepare artifact digest mismatch: '+rel)
+          PYCHECK
+          mkdir -m 700 "$RUNNER_TEMP/rr-cloud-fixture"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/base/base.qcow2" "$RUNNER_TEMP/rr-cloud-fixture/base.qcow2"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/base/base.sha256" "$RUNNER_TEMP/rr-cloud-fixture/base.sha256"
+          ( cd "$RUNNER_TEMP/rr-cloud-fixture" && sha256sum --check base.sha256 )
+          sudo env FIXTURE="$RUNNER_TEMP/rr-cloud-fixture" python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys, time
+          root = pathlib.Path(os.environ['FIXTURE'])
+          def run(args, **kw):
+              return subprocess.run(args, check=True, timeout=kw.pop('timeout', 60), **kw)
+          def digest(p):
+              with open(p, 'rb') as f:
+                  return hashlib.file_digest(f, 'sha256').hexdigest()
+          cores = sorted(os.sched_getaffinity(0))
+          if len(cores) < 4:
+              raise RuntimeError('four non-overlapping guest vCPUs required')
+          for rel, target in [('qemu/usr/bin/qemu-system-x86_64','/usr/bin/qemu-system-x86_64'),('qemu/usr/share/seabios','/usr/share/seabios'),('qemu/usr/share/qemu','/usr/share/qemu')]:
+              path = root / rel
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.symlink_to(target)
+          (root/'qemu/usr/lib/x86_64-linux-gnu').mkdir(parents=True)
+          run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(root/'test-key')])
+          client_pub = (root/'test-key.pub').read_text().strip()
+          specs, known = {}, []
+          for idx, role in enumerate(['landing','line-a','line-b']):
+              d = root/role
+              d.mkdir(mode=0o700)
+              run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(d/'host-key')])
+              ssh, socks = 2201+idx, 1081+idx
+              pub = (d/'host-key.pub').read_text().split()
+              known.append(f'[127.0.0.1]:{ssh} {pub[0]} {pub[1]}\n')
+              cpus, ram, affinity = (2,2048,cores[:2]) if idx == 0 else (1,1024,[cores[idx+1]])
+              net = {'version':2,'ethernets':{'mgmt':{'match':{'macaddress':f'52:54:00:26:{idx:02}:00'},'set-name':'mgmt','dhcp4':True}}}
+              addresses = ['192.0.2.2/30','192.0.2.6/30'] if idx == 0 else ['192.0.2.1/30' if idx == 1 else '192.0.2.5/30']
+              for n, addr in enumerate(addresses):
+                  mac = f'52:54:00:26:00:{n+1:02}' if idx == 0 else f'52:54:00:26:{idx:02}:01'
+                  net['ethernets'][f'data{n}'] = {'match':{'macaddress':mac},'set-name':f'data{n}','addresses':[addr],'dhcp4':False,'dhcp6':False}
+              user = {'users':[{'name':'rrtest','shell':'/bin/bash','lock_passwd':True,'sudo':['ALL=(ALL) NOPASSWD:ALL'],'ssh_authorized_keys':[client_pub]}], 'ssh_pwauth':False,'disable_root':True,'ssh_keys':{'ed25519_private':(d/'host-key').read_text(),'ed25519_public':(d/'host-key.pub').read_text()},'packages':['curl','iproute2','procps','openssl','ca-certificates'],'swap':{'size':0}}
+              (d/'user-data').write_text('#cloud-config\n'+json.dumps(user))
+              os.chmod(d/'user-data',0o600)
+              (d/'meta-data').write_text(json.dumps({'instance-id':'rr-'+role,'local-hostname':'rr-'+role}))
+              (d/'network-config').write_text(json.dumps(net))
+              run(['cloud-localds','--network-config',str(d/'network-config'),str(d/'seed.iso'),str(d/'user-data'),str(d/'meta-data')])
+              run(['qemu-img','create','-f','qcow2','-F','qcow2','-b',str(root/'base.qcow2'),str(d/'disk.qcow2')])
+              run(['qemu-img','resize',str(d/'disk.qcow2'),'8G'])
+              cmd = ['taskset','-c',','.join(map(str,affinity)),str(root/'qemu/usr/bin/qemu-system-x86_64'),'-accel','kvm','-cpu','host','-smp',str(cpus),'-m',str(ram),'-nodefaults','-display','none','-no-reboot','-bios',str(root/'qemu/usr/share/seabios/bios-256k.bin'),'-L',str(root/'qemu/usr/share/qemu'),'-drive',f'file={d}/disk.qcow2,if=virtio,format=qcow2','-drive',f'file={d}/seed.iso,media=cdrom,readonly=on','-serial',f'file:{d}/serial.log','-qmp',f'unix:{d}/qmp.sock,server=on,wait=off','-netdev',f'user,id=mgmt,hostfwd=tcp:127.0.0.1:{ssh}-:22,hostfwd=tcp:127.0.0.1:{socks}-:1080','-device',f'virtio-net-pci,netdev=mgmt,mac=52:54:00:26:{idx:02}:00,romfile=']
+              for n in range(2 if idx == 0 else 1):
+                  port = 3101+n if idx == 0 else 3100+idx
+                  direction = 'listen' if idx == 0 else 'connect'
+                  mac = f'52:54:00:26:00:{n+1:02}' if idx == 0 else f'52:54:00:26:{idx:02}:01'
+                  cmd += ['-netdev',f'socket,id=data{n},{direction}=127.0.0.1:{port}','-device',f'virtio-net-pci,netdev=data{n},mac={mac},romfile=']
+              specs[role] = {'command':cmd,'sshPort':ssh,'socksPort':socks,'cpus':cpus,'ramMiB':ram,'cores':','.join(map(str,affinity))}
+          (root/'known_hosts').write_text(''.join(known))
+          (root/'guests.json').write_text(json.dumps(specs))
+          children, logs = [], []
+          try:
+              for role, spec in specs.items():
+                  cmd = list(spec['command'])
+                  at = cmd.index('-qmp'); del cmd[at:at+2]
+                  cmd += ['-monitor','none']
+                  log = open(root/role/'provision.log','wb'); logs.append(log)
+                  children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
+              for role, spec in specs.items():
+                  ssh = ['ssh','-F','/dev/null','-i',str(root/'test-key'),'-o','UserKnownHostsFile='+str(root/'known_hosts'),'-o','StrictHostKeyChecking=yes','-o','BatchMode=yes','-o','ConnectTimeout=3','-p',str(spec['sshPort']),'rrtest@127.0.0.1']
+                  deadline = time.monotonic()+300
+                  started = time.monotonic()
+                  last = 'not-started'
+                  while True:
+                      if time.monotonic() > deadline or any(p.poll() is not None for p in children):
+                          elapsed = time.monotonic() - started
+                          print('FAIL: guest SSH not ready: role=%s elapsed_s=%.1f last=%s sshPort=%s' % (role, elapsed, last, spec['sshPort']), file=sys.stderr)
+                          for path in (root/role/'serial.log', root/role/'provision.log'):
+                              if path.is_file():
+                                  print('===== tail %s =====' % path, file=sys.stderr)
+                                  try:
+                                      print(path.read_text(errors='replace')[-4000:], file=sys.stderr)
+                                  except Exception as error:
+                                      print('(unreadable: %s)' % error, file=sys.stderr)
+                          (root/'ssh-ready-failure.json').write_text(json.dumps({
+                              'role': role,
+                              'elapsed_s': round(elapsed, 1),
+                              'last': last,
+                              'sshPort': spec['sshPort'],
+                          }) + '\n')
+                          raise RuntimeError('guest provisioning boot failed: '+role)
+                      try:
+                          result = subprocess.run(ssh+['true'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6)
+                          last = 'returncode=%s' % result.returncode
+                          if result.returncode == 0:
+                              break
+                      except subprocess.TimeoutExpired:
+                          last = 'TimeoutExpired(6s)'
+                      time.sleep(2)
+                  run(ssh+['sudo cloud-init status --wait'],timeout=720,stdout=subprocess.DEVNULL)
+                  run(ssh+['command -v curl && command -v tc && test "$(wc -l < /proc/swaps)" = 1'],stdout=subprocess.DEVNULL)
+              for spec in specs.values():
+                  run(['ssh','-F','/dev/null','-i',str(root/'test-key'),'-o','UserKnownHostsFile='+str(root/'known_hosts'),'-o','StrictHostKeyChecking=yes','-o','BatchMode=yes','-p',str(spec['sshPort']),'rrtest@127.0.0.1','sudo poweroff'])
+              for p in children:
+                  if p.wait(timeout=90) != 0:
+                      raise RuntimeError('guest did not shut down cleanly')
+          finally:
+              for p in children:
+                  if p.poll() is None:
+                      p.terminate()
+                      try: p.wait(timeout=15)
+                      except subprocess.TimeoutExpired: p.kill(); p.wait(timeout=15)
+              for log in logs: log.close()
+          (root/'provision-attestation.json').write_text(json.dumps({'source':'https://cloud-images.ubuntu.com/noble/current/','base_sha256':digest(root/'base.qcow2'),'disks':{r:digest(root/r/'disk.qcow2') for r in specs},'ephemeral':True,'operator_credentials_used':False}))
+          print('Three isolated guests provisioned and stopped; no qualification claim.')
+          PY
+          PROFILE=ordinary
+          case "$MATRIX_CELL" in
+            */constrained) PROFILE=constrained ;;
+          esac
+          PREFLIGHT_ARGS=()
+          if test "$PROFILE" = constrained; then PREFLIGHT_ARGS+=(--constrained); fi
+          sudo env XDG_RUNTIME_DIR="$RUNNER_TEMP/rr-cloud-runtime" \
+            "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" --repo "$GITHUB_WORKSPACE" bench stability-fixture \
+            --fixture "$RUNNER_TEMP/rr-cloud-fixture" \
+            --output "$RUNNER_TEMP/rr-cloud-preflight" "${PREFLIGHT_ARGS[@]}"
+          df -h "$RUNNER_TEMP"
+          set +e
+          sudo env XDG_RUNTIME_DIR="$RUNNER_TEMP/rr-cloud-runtime" \
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" --repo "$GITHUB_WORKSPACE" bench stability-run \
+            --fixture "$RUNNER_TEMP/rr-cloud-fixture" --output "$RUNNER_TEMP/rr-cloud-cell" \
+            --candidate "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality" \
+            --xray "$RUNNER_TEMP/rr-qemu-prepare/tools/xray/xray" \
+            --openssl "$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/bin/openssl" \
+            --cell "$MATRIX_CELL"
+          CELL_STATUS=$?
+          set -e
+          # Always stage partial cell evidence before exiting on fail-closed runs.
+          # Otherwise merge sees "missing cell artifacts" (Class B cascade).
+          # stability-run runs under sudo, so stage with sudo and drop ownership
+          # for upload-artifact. cell-matrix.json is written by Rust (ADR 0046);
+          # fall back only if the campaign exited before freeze completed.
+          CELL_OUT="$RUNNER_TEMP/rr-cloud-cell"
+          sudo mkdir -p "$CELL_OUT"
+          if ! sudo test -f "$CELL_OUT/cell-matrix.json"; then
+            printf '%s\n' "{\"cell\":\"$MATRIX_CELL\",\"slug\":\"$CELL_SLUG\",\"source_commit\":\"$HEAD_SHA\",\"parallelism\":\"actions-matrix\"}" \
+              | sudo tee "$CELL_OUT/cell-matrix.json" >/dev/null
+          fi
+          sudo rm -rf "$RUNNER_TEMP/rr-cell-upload"
+          sudo mkdir -p "$RUNNER_TEMP/rr-cell-upload/cell"
+          sudo cp -a "$CELL_OUT"/. "$RUNNER_TEMP/rr-cell-upload/cell/"
+          if sudo test -d "$RUNNER_TEMP/rr-cloud-preflight"; then
+            sudo mkdir -p "$RUNNER_TEMP/rr-cell-upload/preflight"
+            sudo find "$RUNNER_TEMP/rr-cloud-preflight" -maxdepth 1 \( -name '*.json' -o -name '*-boot-id.txt' \) \
+              -exec cp -a {} "$RUNNER_TEMP/rr-cell-upload/preflight/" \;
+          fi
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/rr-cell-upload"
+          exit "$CELL_STATUS"
+      - name: Retain one-cell campaign evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-cell-${{ env.HEAD_SHA }}-${{ env.CELL_SLUG }}
+          path: ${{ runner.temp }}/rr-cell-upload/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 9
+      - name: Retain small cell failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-diagnostics-${{ env.HEAD_SHA }}-${{ env.CELL_SLUG }}
+          path: |
+            ${{ runner.temp }}/rr-cloud-cell/**/*clock-transport*.log
+            ${{ runner.temp }}/rr-cloud-cell/**/*clock-*.json
+            ${{ runner.temp }}/rr-cloud-cell/**/*terminal*.json
+            ${{ runner.temp }}/rr-cloud-cell/**/cell-diagnosis.json
+            ${{ runner.temp }}/rr-cloud-cell/cells-summary.json
+            ${{ runner.temp }}/rr-cloud-fixture/ssh-ready-failure.json
+            ${{ runner.temp }}/rr-cloud-fixture/landing/serial.log
+            ${{ runner.temp }}/rr-cloud-fixture/landing/provision.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-a/serial.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-a/provision.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-b/serial.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-b/provision.log
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  # Guest-kernel NXR/Handoff UDP. Process-level UDP stays in qualification.yml.
+  qemu-udp-guest:
+    name: QEMU guest UDP ${{ matrix.topology }}/${{ matrix.profile }}
+    needs: [kvm-capability, qemu-prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - topology: nxr
+            profile: ordinary
+            slug: nxr-ordinary
+          - topology: handoff
+            profile: ordinary
+            slug: handoff-ordinary
+          - topology: nxr
+            profile: constrained
+            slug: nxr-constrained
+          - topology: handoff
+            profile: constrained
+            slug: handoff-constrained
+    env:
+      HEAD_SHA: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Restore shared prepare inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hosted-qemu-prepare-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/rr-qemu-prepare
+      - name: Build guest UDP probe and echo
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          rustup toolchain install
+          cargo build --locked --manifest-path tools/Cargo.toml --release --bin rr-udp-probe --bin rr-udp-echo
+      - name: Provision guests and prove LANDING UDP identity
+        timeout-minutes: 110
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test -z "$(git status --porcelain)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl ca-certificates
+          chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality"
+          chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/tools/xray/xray" "$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/bin/openssl"
+          python3 - <<'PYCHECK'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])/'rr-qemu-prepare'
+          meta = json.loads((root/'prepare-identity.json').read_text())
+          if meta['source_commit'] != os.environ['HEAD_SHA']:
+              raise SystemExit('prepare identity commit drift')
+          def digest(path):
+              return hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+          for rel, key in [('bin/rr-dev','rr_dev_sha256'),('bin/rust-reality','candidate_sha256'),('tools/xray/xray','xray_sha256'),('tools/openssl/bin/openssl','openssl_sha256'),('base/base.qcow2','base_sha256')]:
+              if digest(root/rel) != meta[key]:
+                  raise SystemExit('prepare artifact digest mismatch: '+rel)
+          PYCHECK
+          mkdir -m 700 "$RUNNER_TEMP/rr-cloud-fixture"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/base/base.qcow2" "$RUNNER_TEMP/rr-cloud-fixture/base.qcow2"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/base/base.sha256" "$RUNNER_TEMP/rr-cloud-fixture/base.sha256"
+          ( cd "$RUNNER_TEMP/rr-cloud-fixture" && sha256sum --check base.sha256 )
+          sudo env FIXTURE="$RUNNER_TEMP/rr-cloud-fixture" python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys, time
+          root = pathlib.Path(os.environ['FIXTURE'])
+          def run(args, **kw):
+              return subprocess.run(args, check=True, timeout=kw.pop('timeout', 60), **kw)
+          def digest(p):
+              with open(p, 'rb') as f:
+                  return hashlib.file_digest(f, 'sha256').hexdigest()
+          cores = sorted(os.sched_getaffinity(0))
+          if len(cores) < 4:
+              raise RuntimeError('four non-overlapping guest vCPUs required')
+          for rel, target in [('qemu/usr/bin/qemu-system-x86_64','/usr/bin/qemu-system-x86_64'),('qemu/usr/share/seabios','/usr/share/seabios'),('qemu/usr/share/qemu','/usr/share/qemu')]:
+              path = root / rel
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.symlink_to(target)
+          (root/'qemu/usr/lib/x86_64-linux-gnu').mkdir(parents=True)
+          run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(root/'test-key')])
+          client_pub = (root/'test-key.pub').read_text().strip()
+          specs, known = {}, []
+          for idx, role in enumerate(['landing','line-a','line-b']):
+              d = root/role
+              d.mkdir(mode=0o700)
+              run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(d/'host-key')])
+              ssh, socks = 2201+idx, 1081+idx
+              pub = (d/'host-key.pub').read_text().split()
+              known.append(f'[127.0.0.1]:{ssh} {pub[0]} {pub[1]}\n')
+              cpus, ram, affinity = (2,2048,cores[:2]) if idx == 0 else (1,1024,[cores[idx+1]])
+              net = {'version':2,'ethernets':{'mgmt':{'match':{'macaddress':f'52:54:00:26:{idx:02}:00'},'set-name':'mgmt','dhcp4':True}}}
+              addresses = ['192.0.2.2/30','192.0.2.6/30'] if idx == 0 else ['192.0.2.1/30' if idx == 1 else '192.0.2.5/30']
+              for n, addr in enumerate(addresses):
+                  mac = f'52:54:00:26:00:{n+1:02}' if idx == 0 else f'52:54:00:26:{idx:02}:01'
+                  net['ethernets'][f'data{n}'] = {'match':{'macaddress':mac},'set-name':f'data{n}','addresses':[addr],'dhcp4':False,'dhcp6':False}
+              user = {'users':[{'name':'rrtest','shell':'/bin/bash','lock_passwd':True,'sudo':['ALL=(ALL) NOPASSWD:ALL'],'ssh_authorized_keys':[client_pub]}], 'ssh_pwauth':False,'disable_root':True,'ssh_keys':{'ed25519_private':(d/'host-key').read_text(),'ed25519_public':(d/'host-key.pub').read_text()},'packages':['curl','iproute2','procps','openssl','ca-certificates'],'swap':{'size':0}}
+              (d/'user-data').write_text('#cloud-config\n'+json.dumps(user))
+              os.chmod(d/'user-data',0o600)
+              (d/'meta-data').write_text(json.dumps({'instance-id':'rr-'+role,'local-hostname':'rr-'+role}))
+              (d/'network-config').write_text(json.dumps(net))
+              run(['cloud-localds','--network-config',str(d/'network-config'),str(d/'seed.iso'),str(d/'user-data'),str(d/'meta-data')])
+              run(['qemu-img','create','-f','qcow2','-F','qcow2','-b',str(root/'base.qcow2'),str(d/'disk.qcow2')])
+              run(['qemu-img','resize',str(d/'disk.qcow2'),'8G'])
+              cmd = ['taskset','-c',','.join(map(str,affinity)),str(root/'qemu/usr/bin/qemu-system-x86_64'),'-accel','kvm','-cpu','host','-smp',str(cpus),'-m',str(ram),'-nodefaults','-display','none','-no-reboot','-bios',str(root/'qemu/usr/share/seabios/bios-256k.bin'),'-L',str(root/'qemu/usr/share/qemu'),'-drive',f'file={d}/disk.qcow2,if=virtio,format=qcow2','-drive',f'file={d}/seed.iso,media=cdrom,readonly=on','-serial',f'file:{d}/serial.log','-qmp',f'unix:{d}/qmp.sock,server=on,wait=off','-netdev',f'user,id=mgmt,hostfwd=tcp:127.0.0.1:{ssh}-:22,hostfwd=tcp:127.0.0.1:{socks}-:1080','-device',f'virtio-net-pci,netdev=mgmt,mac=52:54:00:26:{idx:02}:00,romfile=']
+              for n in range(2 if idx == 0 else 1):
+                  port = 3101+n if idx == 0 else 3100+idx
+                  direction = 'listen' if idx == 0 else 'connect'
+                  mac = f'52:54:00:26:00:{n+1:02}' if idx == 0 else f'52:54:00:26:{idx:02}:01'
+                  cmd += ['-netdev',f'socket,id=data{n},{direction}=127.0.0.1:{port}','-device',f'virtio-net-pci,netdev=data{n},mac={mac},romfile=']
+              specs[role] = {'command':cmd,'sshPort':ssh,'socksPort':socks,'cpus':cpus,'ramMiB':ram,'cores':','.join(map(str,affinity))}
+          (root/'known_hosts').write_text(''.join(known))
+          (root/'guests.json').write_text(json.dumps(specs))
+          children, logs = [], []
+          try:
+              for role, spec in specs.items():
+                  cmd = list(spec['command'])
+                  at = cmd.index('-qmp'); del cmd[at:at+2]
+                  cmd += ['-monitor','none']
+                  log = open(root/role/'provision.log','wb'); logs.append(log)
+                  children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
+              for role, spec in specs.items():
+                  ssh = ['ssh','-F','/dev/null','-i',str(root/'test-key'),'-o','UserKnownHostsFile='+str(root/'known_hosts'),'-o','StrictHostKeyChecking=yes','-o','BatchMode=yes','-o','ConnectTimeout=3','-p',str(spec['sshPort']),'rrtest@127.0.0.1']
+                  deadline = time.monotonic()+300
+                  started = time.monotonic()
+                  last = 'not-started'
+                  while True:
+                      if time.monotonic() > deadline or any(p.poll() is not None for p in children):
+                          elapsed = time.monotonic() - started
+                          print('FAIL: guest SSH not ready: role=%s elapsed_s=%.1f last=%s sshPort=%s' % (role, elapsed, last, spec['sshPort']), file=sys.stderr)
+                          for path in (root/role/'serial.log', root/role/'provision.log'):
+                              if path.is_file():
+                                  print('===== tail %s =====' % path, file=sys.stderr)
+                                  try:
+                                      print(path.read_text(errors='replace')[-4000:], file=sys.stderr)
+                                  except Exception as error:
+                                      print('(unreadable: %s)' % error, file=sys.stderr)
+                          (root/'ssh-ready-failure.json').write_text(json.dumps({
+                              'role': role,
+                              'elapsed_s': round(elapsed, 1),
+                              'last': last,
+                              'sshPort': spec['sshPort'],
+                          }) + '\n')
+                          raise RuntimeError('guest provisioning boot failed: '+role)
+                      try:
+                          result = subprocess.run(ssh+['true'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6)
+                          last = 'returncode=%s' % result.returncode
+                          if result.returncode == 0:
+                              break
+                      except subprocess.TimeoutExpired:
+                          last = 'TimeoutExpired(6s)'
+                      time.sleep(2)
+                  run(ssh+['sudo cloud-init status --wait'],timeout=720,stdout=subprocess.DEVNULL)
+                  run(ssh+['command -v curl && command -v tc && test "$(wc -l < /proc/swaps)" = 1'],stdout=subprocess.DEVNULL)
+              for spec in specs.values():
+                  run(['ssh','-F','/dev/null','-i',str(root/'test-key'),'-o','UserKnownHostsFile='+str(root/'known_hosts'),'-o','StrictHostKeyChecking=yes','-o','BatchMode=yes','-p',str(spec['sshPort']),'rrtest@127.0.0.1','sudo poweroff'])
+              for p in children:
+                  if p.wait(timeout=90) != 0:
+                      raise RuntimeError('guest did not shut down cleanly')
+          finally:
+              for p in children:
+                  if p.poll() is None:
+                      p.terminate()
+                      try: p.wait(timeout=15)
+                      except subprocess.TimeoutExpired: p.kill(); p.wait(timeout=15)
+              for log in logs: log.close()
+          (root/'provision-attestation.json').write_text(json.dumps({'source':'https://cloud-images.ubuntu.com/noble/current/','base_sha256':digest(root/'base.qcow2'),'disks':{r:digest(root/r/'disk.qcow2') for r in specs},'ephemeral':True,'operator_credentials_used':False}))
+          print('Three isolated guests provisioned and stopped; no qualification claim.')
+          PY
+          PREFLIGHT_ARGS=()
+          if test "${{ matrix.profile }}" = constrained; then PREFLIGHT_ARGS+=(--constrained); fi
+          sudo env XDG_RUNTIME_DIR="$RUNNER_TEMP/rr-cloud-runtime" \
+            "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" --repo "$GITHUB_WORKSPACE" bench stability-fixture \
+            --fixture "$RUNNER_TEMP/rr-cloud-fixture" \
+            --output "$RUNNER_TEMP/rr-cloud-preflight" "${PREFLIGHT_ARGS[@]}"
+          df -h "$RUNNER_TEMP"
+          UDP_ARGS=(
+            --fixture "$RUNNER_TEMP/rr-cloud-fixture"
+            --output "$RUNNER_TEMP/rr-cloud-udp-guest"
+            --candidate "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality"
+            --openssl "$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/bin/openssl"
+            --probe "$GITHUB_WORKSPACE/tools/target/release/rr-udp-probe"
+            --echo "$GITHUB_WORKSPACE/tools/target/release/rr-udp-echo"
+            --topology "${{ matrix.topology }}"
+          )
+          if test "${{ matrix.profile }}" = constrained; then UDP_ARGS+=(--constrained); fi
+          set +e
+          sudo env XDG_RUNTIME_DIR="$RUNNER_TEMP/rr-cloud-runtime" \
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" --repo "$GITHUB_WORKSPACE" bench stability-udp-guest \
+            "${UDP_ARGS[@]}"
+          UDP_STATUS=$?
+          set -e
+          if sudo test -d "$RUNNER_TEMP/rr-cloud-udp-guest"; then
+            sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/rr-cloud-udp-guest"
+          fi
+          exit "$UDP_STATUS"
+      - name: Retain guest UDP receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-udp-guest-${{ env.HEAD_SHA }}-${{ matrix.slug }}
+          path: |
+            ${{ runner.temp }}/rr-cloud-udp-guest/receipt.txt
+            ${{ runner.temp }}/rr-cloud-udp-guest/identity.txt
+            ${{ runner.temp }}/rr-cloud-udp-guest/proof.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Retain guest UDP diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-udp-guest-diagnostics-${{ env.HEAD_SHA }}-${{ matrix.slug }}
+          path: |
+            ${{ runner.temp }}/rr-cloud-udp-guest/
+            ${{ runner.temp }}/rr-cloud-fixture/ssh-ready-failure.json
+            ${{ runner.temp }}/rr-cloud-fixture/landing/serial.log
+            ${{ runner.temp }}/rr-cloud-fixture/landing/provision.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-a/serial.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-a/provision.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-b/serial.log
+            ${{ runner.temp }}/rr-cloud-fixture/line-b/provision.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  qemu-aggregate:
+    name: Merge four-cell QEMU evidence
+    needs: [qemu-cell, qemu-udp-guest]
+    if: always() && needs.qemu-cell.result != 'cancelled' && needs.qemu-udp-guest.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HEAD_SHA: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Restore shared prepare controller
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hosted-qemu-prepare-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/rr-qemu-prepare
+      - name: Restore every cell campaign directory
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: hosted-qemu-cell-${{ env.HEAD_SHA }}-*
+          path: ${{ runner.temp }}/rr-qemu-cells
+          merge-multiple: false
+      - name: Merge identity-bound cell evidence
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          chmod 0755 "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev"
+          # Discover cell-matrix.json markers in Rust (ADR 0046); no Python.
+          set +e
+          "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" --repo "$GITHUB_WORKSPACE" bench stability-merge-cells \
+            --output "$RUNNER_TEMP/rr-cloud-campaign" \
+            --cells-root "$RUNNER_TEMP/rr-qemu-cells"
+          status=$?
+          set -e
+          if test -f "$RUNNER_TEMP/rr-cloud-campaign/verdict.json"; then
+            printf '%s\n' '=== stability-merge-cells verdict.json ==='
+            cat "$RUNNER_TEMP/rr-cloud-campaign/verdict.json"
+          elif test "$status" -ne 0; then
+            printf '%s\n' 'FAIL: stability-merge-cells left no verdict.json' >&2
+          fi
+          if test "$status" -ne 0; then
+            printf '%s\n' "FAIL: stability-merge-cells exited $status" >&2
+            exit "$status"
+          fi
+          # Keep the historical campaign artifact contract for frozen acceptance.
+          cp "$RUNNER_TEMP/rr-qemu-prepare/bin/rr-dev" "$RUNNER_TEMP/rr-cloud-campaign/rr-dev"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/bin/rust-reality" "$RUNNER_TEMP/rr-cloud-campaign/rust-reality"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/tools/xray/xray" "$RUNNER_TEMP/rr-cloud-campaign/xray"
+          cp "$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/bin/openssl" "$RUNNER_TEMP/rr-cloud-campaign/openssl"
+          # ADR 0055: relocated openssl needs a colocated openssl.cnf (OPENSSLDIR is absolute).
+          cp "$RUNNER_TEMP/rr-qemu-prepare/tools/openssl/ssl/openssl.cnf" "$RUNNER_TEMP/rr-cloud-campaign/openssl.cnf"
+          chmod 0755 "$RUNNER_TEMP/rr-cloud-campaign/rr-dev" "$RUNNER_TEMP/rr-cloud-campaign/rust-reality" \
+            "$RUNNER_TEMP/rr-cloud-campaign/xray" "$RUNNER_TEMP/rr-cloud-campaign/openssl"
+
+      - name: Restore guest UDP receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: hosted-qemu-udp-guest-${{ env.HEAD_SHA }}-*
+          path: ${{ runner.temp }}/rr-qemu-udp-guest
+          merge-multiple: false
+      - name: Aggregate guest UDP four-cell fail-closed
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/rr-cloud-campaign/qemu-udp-guest"
+          mkdir -p "$OUT"
+          {
+            printf 'source=%s\nrun=%s\nattempt=%s\n' \
+              "$HEAD_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'gate=qemu-guest-udp-four-cell\n'
+            printf 'cells=nxr/ordinary,handoff/ordinary,nxr/constrained,handoff/constrained\n'
+          } | tee "$OUT/identity.txt"
+          : > "$OUT/receipt.txt"
+          required=$'layer=guest-kernel\nverdict=PASS\nudp_peer=192.0.2.2\nbypass=rejected\nblock_dest=rejected\nfault_drop=rejected\nfault_restore=accepted\ndata_nic_udp=dropped'
+          for slug in nxr-ordinary handoff-ordinary nxr-constrained handoff-constrained; do
+            receipt="$(find "$RUNNER_TEMP/rr-qemu-udp-guest" -type f -path "*${slug}*" -name receipt.txt | head -n1 || true)"
+            if test -z "$receipt" || test ! -f "$receipt"; then
+              printf '%s\n' "FAIL: missing guest UDP receipt for $slug" >&2
+              find "$RUNNER_TEMP/rr-qemu-udp-guest" -type f 2>/dev/null | head -n80 >&2 || true
+              exit 1
+            fi
+            if grep -Eiq 'layer=host-process|skip|ignored as pass|not run' "$receipt"; then
+              printf '%s\n' "FAIL: host-process or SKIP token in $slug" >&2
+              cat "$receipt" >&2
+              exit 1
+            fi
+            if ! grep -Fxq "source=$HEAD_SHA" "$receipt"; then
+              printf '%s\n' "FAIL: $slug source is not $HEAD_SHA" >&2
+              cat "$receipt" >&2
+              exit 1
+            fi
+            while IFS= read -r line; do
+              test -n "$line" || continue
+              if ! grep -Fxq "$line" "$receipt"; then
+                printf '%s\n' "FAIL: $slug missing $line" >&2
+                cat "$receipt" >&2
+                exit 1
+              fi
+            done <<< "$required"
+            # ADR 0069: NXR carries XUDP in its TCP carrier; Handoff uses the
+            # native handoff-udp channel and never a TCP connection.
+            case "$slug" in
+              nxr-*) carrier=nxr-tcp ;;
+              handoff-*) carrier=handoff-udp ;;
+              *) printf '%s\n' "FAIL: unknown cell $slug" >&2; exit 1 ;;
+            esac
+            if ! grep -Fxq "carrier=$carrier" "$receipt"; then
+              printf '%s\n' "FAIL: $slug missing carrier=$carrier" >&2
+              cat "$receipt" >&2
+              exit 1
+            fi
+            cp "$receipt" "$OUT/$slug-receipt.txt"
+            idf="$(dirname "$receipt")/identity.txt"
+            if test -f "$idf"; then
+              cp "$idf" "$OUT/$slug-identity.txt"
+            fi
+            printf 'cell=%s verdict=PASS receipt=%s\n' "$slug" "$receipt" | tee -a "$OUT/receipt.txt"
+          done
+          printf 'verdict=PASS\ncells=4\n' | tee -a "$OUT/receipt.txt"
+
+      - name: Retain campaign evidence without private fixture material
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-campaign-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/rr-cloud-campaign/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 9
+      # ADR 0054: tiny sibling of the 26GiB campaign so Frozen acceptance does not
+      # depend on trailing top-level binaries surviving a 45k-file extract.
+      # ADR 0055: include openssl.cnf so relocated OPENSSLDIR does not break req.
+      - name: Stage frozen executable inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rr-frozen-exec"
+          for name in rr-dev rust-reality xray openssl openssl.cnf environment.json; do
+            cp "$RUNNER_TEMP/rr-cloud-campaign/$name" "$RUNNER_TEMP/rr-frozen-exec/$name"
+          done
+          chmod 0755 "$RUNNER_TEMP/rr-frozen-exec/rr-dev" "$RUNNER_TEMP/rr-frozen-exec/rust-reality"             "$RUNNER_TEMP/rr-frozen-exec/xray" "$RUNNER_TEMP/rr-frozen-exec/openssl"
+      - name: Retain frozen executable inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-frozen-exec-${{ env.HEAD_SHA }}
+          path: ${{ runner.temp }}/rr-frozen-exec/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
+      - name: Retain merge diagnosis on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hosted-qemu-diagnostics-${{ env.HEAD_SHA }}
+          path: |
+            ${{ runner.temp }}/rr-cloud-campaign/verdict.json
+            ${{ runner.temp }}/rr-cloud-campaign/cells-summary.json
+            ${{ runner.temp }}/rr-cloud-campaign/merge-diagnosis.json
+            ${{ runner.temp }}/rr-cloud-campaign/campaign-terminal.json
+            ${{ runner.temp }}/rr-cloud-campaign/**/cell-diagnosis.json
+          if-no-files-found: warn
+          retention-days: 7

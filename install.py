@@ -83,8 +83,8 @@ def preflight(project: Path) -> dict:
         raise InstallError(f'Каталог ноды не найден: {project}')
     if os.environ.get('COMPOSE_FILE'):
         raise InstallError('В окружении задан COMPOSE_FILE. Уберите его и повторите проверку.')
-    if re.search(r'(?m)^\s*(?:export\s+)?COMPOSE_FILE\s*=',
-                 (project / '.env').read_text(encoding='utf-8') if (project / '.env').exists() else ''):
+    if re.search(rb'(?m)^[ \t]*(?:export[ \t]+)?COMPOSE_FILE[ \t]*=',
+                 (project / '.env').read_bytes() if (project / '.env').exists() else b''):
         raise InstallError('В .env уже задан COMPOSE_FILE. Автоматическая правка может потерять другие override-файлы.')
     files = compose_files(project)
     data = json.loads(run(['docker', 'compose', 'config', '--format', 'json'], cwd=project, timeout=45))
@@ -113,29 +113,29 @@ def render_override(binary: Path) -> str:
 
 def set_compose_env(project: Path, files: list[str]) -> tuple[str, bool]:
     env = project / '.env'
-    current = env.read_text(encoding='utf-8') if env.exists() else ''
-    separator = bool(current and not current.endswith('\n'))
+    current = env.read_bytes() if env.exists() else b''
+    separator = bool(current and not current.endswith(b'\n'))
     if separator:
-        current += '\n'
+        current += b'\n'
     value = ':'.join(files + [OVERRIDE])
-    env.write_text(current + MARKER + '\nCOMPOSE_FILE=' + value + '\n', encoding='utf-8')
+    env.write_bytes(current + (MARKER + '\nCOMPOSE_FILE=' + value + '\n').encode())
     os.chmod(env, 0o600)
     return value, separator
 
 
 def clear_compose_env(project: Path, expected: str, separator: bool) -> None:
     env = project / '.env'
-    text = env.read_text(encoding='utf-8')
-    suffix = MARKER + '\nCOMPOSE_FILE=' + expected + '\n'
+    text = env.read_bytes()
+    suffix = (MARKER + '\nCOMPOSE_FILE=' + expected + '\n').encode()
     if not text.endswith(suffix):
         raise InstallError('Конец .env изменён после установки; автоматический откат остановлен.')
     original = text[:-len(suffix)]
     if separator:
-        if not original.endswith('\n'):
+        if not original.endswith(b'\n'):
             raise InstallError('Разделитель .env изменён; автоматический откат остановлен.')
         original = original[:-1]
     if original:
-        env.write_text(original, encoding='utf-8')
+        env.write_bytes(original)
         os.chmod(env, 0o600)
     else:
         env.unlink()
@@ -189,13 +189,13 @@ def install(project: Path, source: Path) -> None:
         # Возврат Compose-конфигурации при любой ошибке установки.
         state_suffix = ':'.join(info['files'] + [OVERRIDE])
         env = project / '.env'
-        if env.exists() and MARKER in env.read_text(encoding='utf-8'):
-            clear_compose_env(project, state_suffix, env_separator)
-        (project / OVERRIDE).unlink(missing_ok=True)
         try:
+            if env.exists() and MARKER.encode() in env.read_bytes():
+                clear_compose_env(project, state_suffix, env_separator)
+            (project / OVERRIDE).unlink(missing_ok=True)
             restart(project)
-        except InstallError as exc:
-            print(f'ВНИМАНИЕ: автоматический возврат контейнера не удался: {exc}', file=sys.stderr)
+        except Exception as exc:
+            print(f'ВНИМАНИЕ: автоматический возврат не удался: {exc}', file=sys.stderr)
         raise
 
 
@@ -211,14 +211,28 @@ def rollback(project: Path) -> None:
     answer = input('Вернуть штатный Xray и пересоздать remnanode? Напишите ОТКАТ: ')
     if answer != 'ОТКАТ':
         print('Отменено.'); return
-    clear_compose_env(project, state['compose_file'], state['env_separator'])
-    (project / OVERRIDE).unlink(missing_ok=False)
-    compose_check(project)
-    restart(project)
-    container = run(['docker', 'compose', 'ps', '-q', 'remnanode'], cwd=project, timeout=20)
-    link = run(['docker', 'exec', container, 'readlink', '/usr/local/bin/rw-core'], timeout=15)
-    if link != '/usr/local/bin/xray':
-        raise InstallError(f'Штатное ядро после отката не подтверждено: {link}')
+    env = project / '.env'
+    override = project / OVERRIDE
+    old_env = env.read_bytes()
+    old_override = override.read_bytes()
+    try:
+        clear_compose_env(project, state['compose_file'], state['env_separator'])
+        override.unlink()
+        compose_check(project)
+        restart(project)
+        container = run(['docker', 'compose', 'ps', '-q', 'remnanode'], cwd=project, timeout=20)
+        link = run(['docker', 'exec', container, 'readlink', '/usr/local/bin/rw-core'], timeout=15)
+        if link != '/usr/local/bin/xray':
+            raise InstallError(f'Штатное ядро после отката не подтверждено: {link}')
+    except Exception:
+        env.write_bytes(old_env)
+        os.chmod(env, 0o600)
+        override.write_bytes(old_override)
+        try:
+            restart(project)
+        except InstallError as exc:
+            print(f'ВНИМАНИЕ: не удалось вернуть Rust-контейнер: {exc}', file=sys.stderr)
+        raise
     path.unlink()
     print('Штатное ядро восстановлено. Проверяйте подключение и счётчики.')
 

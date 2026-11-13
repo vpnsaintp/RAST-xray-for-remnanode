@@ -29,6 +29,15 @@ class InstallerTests(unittest.TestCase):
             install.clear_compose_env(project, value, separator)
             self.assertFalse((project / '.env').exists())
 
+    def test_crlf_env_round_trip_preserves_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            original = b'NODE_PORT=2222\r\nSECRET_KEY=placeholder\r\n'
+            (project / '.env').write_bytes(original)
+            value, separator = install.set_compose_env(project, ['compose.yaml'])
+            install.clear_compose_env(project, value, separator)
+            self.assertEqual((project / '.env').read_bytes(), original)
+
     def test_changed_env_blocks_automatic_rollback(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -51,6 +60,29 @@ class InstallerTests(unittest.TestCase):
     def test_override_mount_is_read_only(self):
         output = install.render_override(Path('/opt/rast-xray/hash/xray'))
         self.assertIn('/usr/local/bin/xray:ro', output)
+
+    def test_failed_rollback_restores_managed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'node'
+            project.mkdir()
+            value, separator = install.set_compose_env(project, ['compose.yaml'])
+            override = project / install.OVERRIDE
+            override.write_text(install.render_override(Path('/tmp/xray')), encoding='utf-8')
+            old_env, old_override = (project / '.env').read_bytes(), override.read_bytes()
+            (root / 'state.json').write_text(json.dumps({
+                'project': str(project), 'compose_file': value, 'env_separator': separator
+            }), encoding='utf-8')
+            with patch.object(install, 'INSTALL_ROOT', root), \
+                 patch.object(install.os, 'geteuid', return_value=0, create=True), \
+                 patch('builtins.input', return_value='ОТКАТ'), \
+                 patch.object(install, 'compose_check', side_effect=install.InstallError('bad compose')), \
+                 patch.object(install, 'restart') as restart:
+                with self.assertRaisesRegex(install.InstallError, 'bad compose'):
+                    install.rollback(project)
+                restart.assert_called_once_with(project)
+            self.assertEqual((project / '.env').read_bytes(), old_env)
+            self.assertEqual(override.read_bytes(), old_override)
 
     @unittest.skipUnless(shutil.which('docker'), 'Docker Compose недоступен')
     def test_real_docker_compose_accepts_generated_override(self):

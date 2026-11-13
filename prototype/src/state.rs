@@ -71,7 +71,9 @@ impl Traffic {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let Some(stats) = stats.upgrade() else { break; };
+                let Some(stats) = stats.upgrade() else {
+                    break;
+                };
                 stats.clock.store(now(), Relaxed);
             }
         });
@@ -142,12 +144,17 @@ pub struct Counter {
 
 impl Counter {
     fn new(shared: bool) -> Self {
-        Self { value: AtomicI64::new(0),
-            shards: shared.then(|| Box::new(std::array::from_fn(|_| CounterShard::default()))) }
+        Self {
+            value: AtomicI64::new(0),
+            shards: shared.then(|| Box::new(std::array::from_fn(|_| CounterShard::default()))),
+        }
     }
 
     fn add(&self, shard: usize, size: i64) {
-        let counter = self.shards.as_ref().map_or(&self.value, |shards| &shards[shard].0);
+        let counter = self
+            .shards
+            .as_ref()
+            .map_or(&self.value, |shards| &shards[shard].0);
         let mut value = counter.load(Relaxed);
         while let Err(current) =
             counter.compare_exchange_weak(value, value.saturating_add(size), Relaxed, Relaxed)
@@ -158,9 +165,21 @@ impl Counter {
 }
 
 pub fn read_counter(counter: &Counter, reset: bool) -> i64 {
-    let read = |value: &AtomicI64| if reset { value.swap(0, Relaxed) } else { value.load(Relaxed) };
-    counter.shards.as_ref().map_or_else(|| read(&counter.value), |shards|
-        shards.iter().fold(0_i64, |total, shard| total.saturating_add(read(&shard.0))))
+    let read = |value: &AtomicI64| {
+        if reset {
+            value.swap(0, Relaxed)
+        } else {
+            value.load(Relaxed)
+        }
+    };
+    counter.shards.as_ref().map_or_else(
+        || read(&counter.value),
+        |shards| {
+            shards
+                .iter()
+                .fold(0_i64, |total, shard| total.saturating_add(read(&shard.0)))
+        },
+    )
 }
 
 impl Meter {
@@ -201,7 +220,12 @@ impl Meter {
             let mut handles = Vec::with_capacity(3);
             let mut register = |kind, tag| {
                 let name = format!("{kind}>>>{tag}>>>traffic>>>{direction}");
-                handles.push(registry.entry(name).or_insert_with(|| Arc::new(Counter::new(kind != "user"))).clone());
+                handles.push(
+                    registry
+                        .entry(name)
+                        .or_insert_with(|| Arc::new(Counter::new(kind != "user")))
+                        .clone(),
+                );
             };
             register("inbound", inner.inbound.as_str());
             if let Some(tag) = inner.outbound.as_deref() {

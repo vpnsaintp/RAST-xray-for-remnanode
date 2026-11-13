@@ -148,10 +148,14 @@ where
     Ok(())
 }
 
-fn start_response(reply: &mut SendResponse<Bytes>, settings: &Settings) -> Result<SendStream<Bytes>> {
+fn start_response(
+    reply: &mut SendResponse<Bytes>,
+    settings: &Settings,
+) -> Result<SendStream<Bytes>> {
     let mut random = [0; 2];
     aws_lc_rs::rand::fill(&mut random).map_err(|_| anyhow::anyhow!("XHTTP padding RNG failed"))?;
-    let count = PADDING_MIN + usize::from(u16::from_ne_bytes(random)) % (PADDING_MAX - PADDING_MIN + 1);
+    let count =
+        PADDING_MIN + usize::from(u16::from_ne_bytes(random)) % (PADDING_MAX - PADDING_MIN + 1);
     let mut padding = http::HeaderValue::from_str(&"X".repeat(count))?;
     padding.set_sensitive(true);
     let mut response = Response::builder()

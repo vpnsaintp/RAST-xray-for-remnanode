@@ -32,7 +32,9 @@ pub(crate) fn validate_domain(domain: &str) -> Result<&str> {
     let name = domain.trim_end_matches('.');
     ensure!(
         !name.is_empty()
-            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte)),
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte)),
         "invalid destination domain"
     );
     Ok(name)

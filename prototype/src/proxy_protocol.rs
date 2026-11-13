@@ -36,7 +36,14 @@ fn parse_v1(line: &str, endpoints: Endpoints) -> Result<Endpoints> {
     let fields: Vec<_> = line.split(' ').collect();
     match fields.as_slice() {
         ["PROXY", "UNKNOWN", ..] => Ok(endpoints),
-        ["PROXY", "TCP4", source, destination, source_port, destination_port] => Ok((
+        [
+            "PROXY",
+            "TCP4",
+            source,
+            destination,
+            source_port,
+            destination_port,
+        ] => Ok((
             (source.parse::<Ipv4Addr>()?, source_port.parse::<u16>()?).into(),
             (
                 destination.parse::<Ipv4Addr>()?,
@@ -44,7 +51,14 @@ fn parse_v1(line: &str, endpoints: Endpoints) -> Result<Endpoints> {
             )
                 .into(),
         )),
-        ["PROXY", "TCP6", source, destination, source_port, destination_port] => Ok((
+        [
+            "PROXY",
+            "TCP6",
+            source,
+            destination,
+            source_port,
+            destination_port,
+        ] => Ok((
             (source.parse::<Ipv6Addr>()?, source_port.parse::<u16>()?).into(),
             (
                 destination.parse::<Ipv6Addr>()?,

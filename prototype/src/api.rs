@@ -51,17 +51,27 @@ impl Api {
                 let user = decode::<AddUserOperation>(&operation.value)?
                     .user
                     .ok_or_else(|| Status::invalid_argument("user missing"))?;
-                let account = user.account.ok_or_else(|| Status::invalid_argument("account missing"))?;
+                let account = user
+                    .account
+                    .ok_or_else(|| Status::invalid_argument("account missing"))?;
                 if account.r#type != crate::shadowsocks::ACCOUNT_TYPE || user.level != 0 {
-                    return Err(Status::unimplemented("unsupported Shadowsocks account settings"));
+                    return Err(Status::unimplemented(
+                        "unsupported Shadowsocks account settings",
+                    ));
                 }
-                let client = crate::shadowsocks::Client::from_account(user.email, decode(&account.value)?)
-                    .map_err(|_| Status::invalid_argument("invalid Shadowsocks account"))?;
-                if users.values().any(|old| old.user.email == client.user.email && old.same_key(&client)) {
+                let client =
+                    crate::shadowsocks::Client::from_account(user.email, decode(&account.value)?)
+                        .map_err(|_| Status::invalid_argument("invalid Shadowsocks account"))?;
+                if users
+                    .values()
+                    .any(|old| old.user.email == client.user.email && old.same_key(&client))
+                {
                     return Ok(Response::new(AlterInboundResponse {}));
                 }
                 if users.contains_key(&client.id())
-                    || users.values().any(|old| old.user.email == client.user.email || old.same_key(&client))
+                    || users
+                        .values()
+                        .any(|old| old.user.email == client.user.email || old.same_key(&client))
                 {
                     return Err(Status::already_exists("user already exists"));
                 }
@@ -69,7 +79,10 @@ impl Api {
             }
             "xray.app.proxyman.command.RemoveUserOperation" => {
                 let email = decode::<RemoveUserOperation>(&operation.value)?.email;
-                let id = users.values().find(|client| client.user.email == email).map(|client| client.id())
+                let id = users
+                    .values()
+                    .find(|client| client.user.email == email)
+                    .map(|client| client.id())
                     .ok_or_else(|| Status::not_found("user missing"))?;
                 if let Some(client) = users.remove(&id) {
                     client.user.cancel();
@@ -122,15 +135,16 @@ pub async fn serve(name: String, state: Arc<State>, backend: Arc<Backend>) -> Re
     // Remnanode and the core run under the same UID. Abstract sockets have no
     // filesystem permissions, so reject other UIDs before starting gRPC.
     let uid = unsafe { libc::geteuid() };
-    let incoming = UnixListenerStream::new(UnixListener::from_std(listener)?).filter_map(
-        move |accepted| match accepted {
-            Ok(stream) if stream.peer_cred().is_ok_and(|peer| peer.uid() == uid) => {
-                Some(Ok(stream))
+    let incoming =
+        UnixListenerStream::new(UnixListener::from_std(listener)?).filter_map(move |accepted| {
+            match accepted {
+                Ok(stream) if stream.peer_cred().is_ok_and(|peer| peer.uid() == uid) => {
+                    Some(Ok(stream))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
             }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        },
-    );
+        });
     tonic::transport::Server::builder()
         .add_service(HandlerServiceServer::new(api.clone()))
         .add_service(StatsServiceServer::new(api))
@@ -267,7 +281,10 @@ impl HandlerService for Api {
     ) -> Result<Response<GetInboundUserResponse>, Status> {
         let request = request.into_inner();
         if let Some(users) = self.state.shadowsocks.get(&request.tag) {
-            let users = users.read().unwrap().values()
+            let users = users
+                .read()
+                .unwrap()
+                .values()
                 .filter(|client| request.email.is_empty() || client.user.email == request.email)
                 .map(|client| User {
                     level: 0,
@@ -276,7 +293,8 @@ impl HandlerService for Api {
                         r#type: crate::shadowsocks::ACCOUNT_TYPE.into(),
                         value: client.account().encode_to_vec(),
                     }),
-                }).collect();
+                })
+                .collect();
             return Ok(Response::new(GetInboundUserResponse { users }));
         }
         let inbound = self.inbound(&request.tag)?.read().unwrap();

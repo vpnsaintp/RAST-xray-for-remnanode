@@ -76,7 +76,11 @@ impl TlsUpstream {
             let port = if suffix.is_empty() {
                 None
             } else {
-                Some(suffix.strip_prefix(':').context("invalid DoT endpoint suffix")?)
+                Some(
+                    suffix
+                        .strip_prefix(':')
+                        .context("invalid DoT endpoint suffix")?,
+                )
             };
             (host, port)
         } else if address.parse::<IpAddr>().is_ok() {
@@ -90,7 +94,8 @@ impl TlsUpstream {
             .map(|value| value.parse::<u16>().context("invalid DoT port"))
             .transpose()?;
         ensure!(
-            port.zip(explicit_port).is_none_or(|(left, right)| left == right),
+            port.zip(explicit_port)
+                .is_none_or(|(left, right)| left == right),
             "conflicting DoT ports"
         );
         let port = explicit_port.or(port).unwrap_or(853);
@@ -120,9 +125,8 @@ fn system_tls_config() -> Result<Arc<ClientConfig>> {
         .context("system CA bundle is unavailable for DoT")?
     };
     let mut roots = RootCertStore::empty();
-    let (loaded, _) = roots.add_parsable_certificates(
-        CertificateDer::pem_slice_iter(&bundle).filter_map(Result::ok),
-    );
+    let (loaded, _) = roots
+        .add_parsable_certificates(CertificateDer::pem_slice_iter(&bundle).filter_map(Result::ok));
     ensure!(loaded != 0, "system CA bundle has no usable certificates");
     let config = ClientConfig::builder(Arc::new(rustls_aws_lc_rs::DEFAULT_PROVIDER))
         .with_root_certificates(roots)
@@ -252,7 +256,9 @@ impl Resolver {
                         }
                         ServerAddress::Tls(upstream) => QueryTransport::Tls(
                             upstream,
-                            self.tls.as_ref().context("DoT client configuration unavailable")?,
+                            self.tls
+                                .as_ref()
+                                .context("DoT client configuration unavailable")?,
                         ),
                         _ => continue,
                     };
@@ -306,10 +312,13 @@ async fn resolve_records(
 ) -> (Vec<IpAddr>, u32) {
     let find = |enabled, kind| async move {
         if enabled {
-            timeout(QUERY_TIMEOUT, resolve(transport, query.clone(), kind, allow_tcp))
-                .await
-                .ok()
-                .and_then(Result::ok)
+            timeout(
+                QUERY_TIMEOUT,
+                resolve(transport, query.clone(), kind, allow_tcp),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
         } else {
             None
         }
@@ -339,11 +348,7 @@ async fn resolve(
         for _ in 0..8 {
             let mut ips = Vec::new();
             let mut alias = None;
-            for record in answer
-                .answers
-                .iter()
-                .filter(|record| record.name == name)
-            {
+            for record in answer.answers.iter().filter(|record| record.name == name) {
                 match (kind, &record.data) {
                     (RecordType::A, RData::A(ip)) => ips.push(IpAddr::V4(ip.0)),
                     (RecordType::AAAA, RData::AAAA(ip)) => ips.push(IpAddr::V6(ip.0)),
@@ -380,7 +385,9 @@ async fn exchange(
     message.add_query(query.clone());
     let bytes = message.to_vec()?;
     let reply = match transport {
-        QueryTransport::Udp(address) => udp_exchange(address, &bytes, id, &query, allow_tcp).await?,
+        QueryTransport::Udp(address) => {
+            udp_exchange(address, &bytes, id, &query, allow_tcp).await?
+        }
         QueryTransport::Tls(upstream, tls) => {
             // Bootstrap with system DNS so resolving the DoT name never recurses into itself.
             let addresses: Vec<_> = lookup_host((upstream.host.as_str(), upstream.port))
@@ -461,9 +468,15 @@ mod tests {
     #[test]
     fn dot_endpoint_preserves_identity_and_selects_the_port() -> Result<()> {
         let endpoint = TlsUpstream::parse("DNS.Quad9.Net.", None)?;
-        assert_eq!((endpoint.host.as_str(), endpoint.port), ("dns.quad9.net", 853));
+        assert_eq!(
+            (endpoint.host.as_str(), endpoint.port),
+            ("dns.quad9.net", 853)
+        );
         let endpoint = TlsUpstream::parse("[2620:fe::fe]:8853", None)?;
-        assert_eq!((endpoint.host.as_str(), endpoint.port), ("2620:fe::fe", 8853));
+        assert_eq!(
+            (endpoint.host.as_str(), endpoint.port),
+            ("2620:fe::fe", 8853)
+        );
         assert!(TlsUpstream::parse("dns.quad9.net:853", Some(8853)).is_err());
         assert!(TlsUpstream::parse("dns.quad9.net:0", None).is_err());
         assert!(TlsUpstream::parse("dns.quad9.net/dns-query", None).is_err());

@@ -198,7 +198,12 @@ fn dht(packet: &[u8]) -> bool {
             matches!(
                 method,
                 Some(
-                    b"ping" | b"find_node" | b"get_peers" | b"announce_peer" | b"get" | b"put"
+                    b"ping"
+                        | b"find_node"
+                        | b"get_peers"
+                        | b"announce_peer"
+                        | b"get"
+                        | b"put"
                         | b"sample_infohashes"
                 )
             ) && arguments.is_some_and(node_id)
@@ -231,7 +236,9 @@ fn bencode_string<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
         return None;
     }
     let length = input[..digits].iter().try_fold(0usize, |value, &digit| {
-        value.checked_mul(10)?.checked_add(usize::from(digit - b'0'))
+        value
+            .checked_mul(10)?
+            .checked_add(usize::from(digit - b'0'))
     })?;
     take(input, digits + 1)?;
     take(input, length)
@@ -425,8 +432,12 @@ mod tests {
         assert!(dht(reply));
         assert!(!dht(&ping[..ping.len() - 1]));
         assert!(!dht(b"d1:ad2:id5:shorte1:q4:ping1:t2:aa1:y1:qe"));
-        assert!(!dht(b"d1:ad2:id20:01234567890123456789e1:q4:test1:t2:aa1:y1:qe"));
-        assert!(!dht(b"d1:ad2:id999999999999999999999:1ae1:q4:ping1:t2:aa1:y1:qe"));
+        assert!(!dht(
+            b"d1:ad2:id20:01234567890123456789e1:q4:test1:t2:aa1:y1:qe"
+        ));
+        assert!(!dht(
+            b"d1:ad2:id999999999999999999999:1ae1:q4:ping1:t2:aa1:y1:qe"
+        ));
     }
 
     #[test]

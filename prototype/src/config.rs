@@ -168,7 +168,8 @@ impl InboundTlsSettings {
         let chain = CertificateDer::pem_slice_iter(&certificate_pem)
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("invalid inbound TLS certificate PEM")?;
-        let identity = Identity::from_cert_chain(chain).context("missing inbound TLS certificate")?;
+        let identity =
+            Identity::from_cert_chain(chain).context("missing inbound TLS certificate")?;
         let key = PrivateKeyDer::from_pem_slice(&key_pem).context("invalid inbound TLS key PEM")?;
         let mut tls = ServerConfig::builder(Arc::new(provider))
             .with_no_client_auth()
@@ -247,7 +248,9 @@ impl RealityTarget {
                 *address == listener
                     || (listener.ip().is_unspecified() && address.port() == listener.port())
             }
-            Self::Domain(target) => listener.ip().is_unspecified() && target.port == listener.port(),
+            Self::Domain(target) => {
+                listener.ip().is_unspecified() && target.port == listener.port()
+            }
         }
     }
 }
@@ -504,9 +507,10 @@ async fn from_profile(value: serde_json::Value) -> Result<Config> {
                     ensure!(
                         !matches!(
                             transport,
-                            Transport::WebSocket(_) | Transport::Grpc(_) |
-                            Transport::Reality { xhttp: Some(_), .. } |
-                            Transport::Reality { grpc: Some(_), .. }
+                            Transport::WebSocket(_)
+                                | Transport::Grpc(_)
+                                | Transport::Reality { xhttp: Some(_), .. }
+                                | Transport::Reality { grpc: Some(_), .. }
                         ) || flow.is_empty(),
                         "Vision requires a TLS or REALITY TCP inbound"
                     );
@@ -535,16 +539,31 @@ async fn from_profile(value: serde_json::Value) -> Result<Config> {
             _ => bail!("unsupported inbound protocol"),
         }
     }
-    ensure!(!inbounds.is_empty() || !shadowsocks.is_empty(), "no proxy inbounds");
+    ensure!(
+        !inbounds.is_empty() || !shadowsocks.is_empty(),
+        "no proxy inbounds"
+    );
     let mut tags = std::collections::HashSet::new();
-    for tag in inbounds.iter().map(|inbound| &inbound.tag)
-        .chain(shadowsocks.iter().map(|inbound| &inbound.tag)) {
+    for tag in inbounds
+        .iter()
+        .map(|inbound| &inbound.tag)
+        .chain(shadowsocks.iter().map(|inbound| &inbound.tag))
+    {
         ensure!(tags.insert(tag), "duplicate inbound tag");
     }
     if let Some(path) = companion_path {
-        ensure!(shadowsocks.is_empty(), "Shadowsocks requires native routing");
+        ensure!(
+            shadowsocks.is_empty(),
+            "Shadowsocks requires native routing"
+        );
         let (backend, child) = GoRouter::start(&path, value).await?;
-        Ok(assemble(inbounds, shadowsocks, api, Backend::Go(backend), Some(child)))
+        Ok(assemble(
+            inbounds,
+            shadowsocks,
+            api,
+            Backend::Go(backend),
+            Some(child),
+        ))
     } else {
         let routing = if profile.routing.is_null() {
             RoutingConfig::default()
@@ -558,7 +577,13 @@ async fn from_profile(value: serde_json::Value) -> Result<Config> {
             .transpose()
             .context("unsupported native DNS settings")?;
         let router = Router::new(routing, outbounds, None, dns)?;
-        Ok(assemble(inbounds, shadowsocks, api, Backend::Native(router), None))
+        Ok(assemble(
+            inbounds,
+            shadowsocks,
+            api,
+            Backend::Native(router),
+            None,
+        ))
     }
 }
 
@@ -586,10 +611,15 @@ impl StreamSettings {
                 Ok(Transport::WebSocket(settings))
             }
             ("grpc", "" | "none") => {
-                ensure!(address.ip().is_loopback() && self.reality_settings.is_none()
-                    && self.tls_settings.is_none() && self.ws_settings.is_none()
-                    && self.xhttp_settings.is_none() && !self.sockopt.accept_proxy_protocol,
-                    "cleartext gRPC requires a loopback listener behind a TLS reverse proxy");
+                ensure!(
+                    address.ip().is_loopback()
+                        && self.reality_settings.is_none()
+                        && self.tls_settings.is_none()
+                        && self.ws_settings.is_none()
+                        && self.xhttp_settings.is_none()
+                        && !self.sockopt.accept_proxy_protocol,
+                    "cleartext gRPC requires a loopback listener behind a TLS reverse proxy"
+                );
                 let settings = self.grpc_settings.take().context("missing grpcSettings")?;
                 settings.validate()?;
                 Ok(Transport::Grpc(settings))
@@ -606,11 +636,17 @@ impl StreamSettings {
                     "public REALITY PROXY protocol requires trustedProxyProtocolSources"
                 );
                 let xhttp = if matches!(network, "xhttp" | "splithttp") {
-                    let mut settings = self.xhttp_settings.take().context("missing xhttpSettings")?;
+                    let mut settings = self
+                        .xhttp_settings
+                        .take()
+                        .context("missing xhttpSettings")?;
                     settings.validate()?;
                     Some(Arc::new(settings))
                 } else {
-                    ensure!(self.xhttp_settings.is_none(), "unexpected XHTTP settings on this inbound");
+                    ensure!(
+                        self.xhttp_settings.is_none(),
+                        "unexpected XHTTP settings on this inbound"
+                    );
                     None
                 };
                 let grpc = if network == "grpc" {
@@ -618,7 +654,10 @@ impl StreamSettings {
                     settings.validate()?;
                     Some(Arc::new(settings))
                 } else {
-                    ensure!(self.grpc_settings.is_none(), "unexpected gRPC settings on this inbound");
+                    ensure!(
+                        self.grpc_settings.is_none(),
+                        "unexpected gRPC settings on this inbound"
+                    );
                     None
                 };
                 let reality = self
@@ -742,7 +781,8 @@ fn assemble(
             .iter()
             .map(|inbound| (inbound.tag.clone(), inbound.users.clone()))
             .collect(),
-        shadowsocks: shadowsocks.iter()
+        shadowsocks: shadowsocks
+            .iter()
             .map(|inbound| (inbound.tag.clone(), inbound.users.clone()))
             .collect(),
         stats: Arc::new(Traffic::default()),

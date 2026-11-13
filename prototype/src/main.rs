@@ -72,7 +72,11 @@ async fn main() -> Result<()> {
         services.spawn(serve(listener, Arc::new(inbound), backend, stats));
     }
     for inbound in config.shadowsocks {
-        inbound.start(&mut services, config.backend.clone(), config.state.stats.clone())?;
+        inbound.start(
+            &mut services,
+            config.backend.clone(),
+            config.state.stats.clone(),
+        )?;
     }
     if let Some(name) = config.api_socket {
         services.spawn(api::serve(name, config.state, config.backend.clone()));
@@ -242,7 +246,11 @@ async fn session(
                 )
                 .await??;
                 if !is_reality {
-                    let mut site = timeout(CONNECT_TIMEOUT, connect_reality_target(destination, local_listener)).await??;
+                    let mut site = timeout(
+                        CONNECT_TIMEOUT,
+                        connect_reality_target(destination, local_listener),
+                    )
+                    .await??;
                     timeout(CONNECT_TIMEOUT, site.write_all(&preface)).await??;
                     if splice::enabled() {
                         splice::copy_tcp(&mut socket, &mut site).await?;
@@ -259,16 +267,25 @@ async fn session(
             .await??;
             if let Some(settings) = xhttp {
                 return xhttp::serve(stream, settings, |stream| {
-                    let (inbound, backend, traffic) = (inbound.clone(), backend.clone(), traffic.clone());
-                    async move { vless_session(stream, peer, listener, &inbound, &backend, traffic, None).await }
+                    let (inbound, backend, traffic) =
+                        (inbound.clone(), backend.clone(), traffic.clone());
+                    async move {
+                        vless_session(stream, peer, listener, &inbound, &backend, traffic, None)
+                            .await
+                    }
                 })
                 .await;
             }
             if let Some(settings) = grpc {
                 return grpc::serve(stream, settings, false, |stream, _| {
-                    let (inbound, backend, traffic) = (inbound.clone(), backend.clone(), traffic.clone());
-                    async move { vless_session(stream, peer, listener, &inbound, &backend, traffic, None).await }
-                }).await;
+                    let (inbound, backend, traffic) =
+                        (inbound.clone(), backend.clone(), traffic.clone());
+                    async move {
+                        vless_session(stream, peer, listener, &inbound, &backend, traffic, None)
+                            .await
+                    }
+                })
+                .await;
             }
             let direct = stream.direct_read_control();
             vless_session(
@@ -282,15 +299,31 @@ async fn session(
             )
             .await
         }
-        Transport::Grpc(settings) => grpc::serve(socket, settings, peer.ip().is_loopback(), |stream, forwarded| {
-            let (inbound, backend, traffic) = (inbound.clone(), backend.clone(), traffic.clone());
-            let peer = forwarded.map_or(peer, |ip| SocketAddr::new(ip, 0));
-            async move { vless_session(stream, peer, listener, &inbound, &backend, traffic, None).await }
-        }).await,
+        Transport::Grpc(settings) => {
+            grpc::serve(
+                socket,
+                settings,
+                peer.ip().is_loopback(),
+                |stream, forwarded| {
+                    let (inbound, backend, traffic) =
+                        (inbound.clone(), backend.clone(), traffic.clone());
+                    let peer = forwarded.map_or(peer, |ip| SocketAddr::new(ip, 0));
+                    async move {
+                        vless_session(stream, peer, listener, &inbound, &backend, traffic, None)
+                            .await
+                    }
+                },
+            )
+            .await
+        }
         Transport::WebSocket(settings) => {
             let (stream, forwarded_ip) = timeout(
                 CONNECT_TIMEOUT,
-                ws::accept(socket, settings, &inbound.socket_options.trusted_x_forwarded_for),
+                ws::accept(
+                    socket,
+                    settings,
+                    &inbound.socket_options.trusted_x_forwarded_for,
+                ),
             )
             .await??;
             let peer = forwarded_ip.map_or(peer, |ip| SocketAddr::new(ip, 0));
@@ -312,7 +345,16 @@ async fn session(
             )
             .await??;
             let direct = stream.direct_read_control();
-            vless_session(stream, peer, listener, inbound, backend, traffic, Some(direct)).await
+            vless_session(
+                stream,
+                peer,
+                listener,
+                inbound,
+                backend,
+                traffic,
+                Some(direct),
+            )
+            .await
         }
     }
 }
@@ -323,7 +365,10 @@ async fn connect_reality_target(target: &RealityTarget, listener: SocketAddr) ->
         RealityTarget::Domain(target) => {
             let mut addresses = target.addresses().await?;
             addresses.retain(|address| canonical_address(*address) != listener);
-            ensure!(!addresses.is_empty(), "REALITY fallback has no usable address");
+            ensure!(
+                !addresses.is_empty(),
+                "REALITY fallback has no usable address"
+            );
             Ok(TcpStream::connect(addresses.as_slice()).await?)
         }
     }

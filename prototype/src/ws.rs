@@ -105,7 +105,10 @@ pub async fn accept(
 
 fn forwarded_client_ip(headers: &http::HeaderMap, trusted: &[String]) -> Option<IpAddr> {
     let forwarded = headers.get("x-forwarded-for")?.to_str().ok()?;
-    if !trusted.iter().any(|name| headers.contains_key(name.as_str())) {
+    if !trusted
+        .iter()
+        .any(|name| headers.contains_key(name.as_str()))
+    {
         return None;
     }
     forwarded.split(',').next()?.trim().parse().ok()

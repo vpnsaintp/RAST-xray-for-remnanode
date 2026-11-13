@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 
 use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
@@ -14,13 +14,18 @@ static OPEN: AtomicUsize = AtomicUsize::new(0);
 fn pipe_budget(soft_fd_limit: usize) -> usize {
     // Each pipe uses two descriptors; reserve at least 64 and at least 75%
     // of the process limit for sockets, listeners, logs and other files.
-    (soft_fd_limit / 8).min(soft_fd_limit.saturating_sub(64) / 2).min(4096)
+    (soft_fd_limit / 8)
+        .min(soft_fd_limit.saturating_sub(64) / 2)
+        .min(4096)
 }
 
 fn max_open_pipes() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
             pipe_budget(usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX))
         } else {
@@ -250,7 +255,10 @@ mod tests {
         let open = AtomicUsize::new(0);
         let a = PipeSlot::acquire(&open, 2).unwrap();
         let _b = PipeSlot::acquire(&open, 2).unwrap();
-        assert_eq!(PipeSlot::acquire(&open, 2).err().unwrap().kind(), ErrorKind::WouldBlock);
+        assert_eq!(
+            PipeSlot::acquire(&open, 2).err().unwrap().kind(),
+            ErrorKind::WouldBlock
+        );
         drop(a);
         assert!(PipeSlot::acquire(&open, 2).is_ok());
     }

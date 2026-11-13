@@ -2,7 +2,7 @@
 
 > Совместная разработка Rust-ядра для RemnaNode 3.4.3. Проект распространяется по MPL-2.0; лицензии зависимостей сохранены. Наличие протокола в исходниках не означает, что каждый профиль уже проверен на наших клиентах и узлах.
 
-**Навигация на русском:** [протоколы и ограничения](docs/ПРОТОКОЛЫ.md) · [установка на действующую RemnaNode 3.4.3](docs/УСТАНОВКА-REMNANODE-3.4.3.md) · [проверки перед включением клиентов](docs/ПРОВЕРКИ.md).
+**Навигация на русском:** [интерактивный установщик](docs/ИНТЕРАКТИВНЫЙ-УСТАНОВЩИК.md) · [протоколы и ограничения](docs/ПРОТОКОЛЫ.md) · [ручная установка на RemnaNode 3.4.3](docs/УСТАНОВКА-REMNANODE-3.4.3.md) · [проверки перед включением клиентов](docs/ПРОВЕРКИ.md).
 
 Ядро на Rust для узлов Remnawave с VLESS, REALITY, Vision и WebSocket. Remnanode 3.4.3 передаёт ему конфигурацию через Unix-сокет и управляет пользователями и счётчиками через gRPC. Нативный режим обслуживает трафик без запуска Go Xray.
 
@@ -38,8 +38,8 @@
 ## Сборка на Linux
 
 ```sh
-git clone https://github.com/wsq222222/xray-fork.git
-cd xray-fork
+git clone https://github.com/vpnsaintp/RAST-xray-for-remnanode.git
+cd RAST-xray-for-remnanode
 git clone https://github.com/ssrlive/reality-rs.git
 git -C reality-rs checkout --detach e71b6c20b0860d9fa9589862e81fa8869ed4fa7a
 git -C reality-rs apply --check ../prototype/reality-xray.patch

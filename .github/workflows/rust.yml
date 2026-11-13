@@ -31,4 +31,6 @@ jobs:
         working-directory: prototype
         run: cargo test --locked --release
       - name: Проверить синтаксис Python-тестов
-        run: python3 -m py_compile prototype/test_interop.py prototype/test_node_client.py prototype/test_remnawave.py
+        run: python3 -m py_compile install.py prototype/test_interop.py prototype/test_node_client.py prototype/test_remnawave.py
+      - name: Проверить установщик без работающей ноды
+        run: python3 -m unittest discover -s tests -v

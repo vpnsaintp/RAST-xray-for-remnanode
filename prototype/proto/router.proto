@@ -1,0 +1,9 @@
+syntax = "proto3";
+package xray.app.router.command;
+
+message RemoveRuleRequest { string ruleTag = 1; }
+message RemoveRuleResponse {}
+
+service RoutingService {
+  rpc RemoveRule(RemoveRuleRequest) returns (RemoveRuleResponse);
+}

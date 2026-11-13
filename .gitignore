@@ -1,48 +1,9 @@
-# Rust build output
-#
-# Unanchored so it also covers the independent tooling workspace at
-# tools/target, which a root-anchored `/target` would miss.
-target/
-/dist/
-
-# Local runtime configuration
-/config.toml
-/.env
-
-# Secrets
-/secrets/
-*.key
-*.pem
-
-# Packet captures
-/captures/
-*.pcap
-*.pcapng
-
-# Temporary test output
-/test-output/
-/scripts/__pycache__/
-/fuzz/artifacts/
-/fuzz/corpus/
-/fuzz/coverage/
-/benchmarks/rust-reality-matrix.*/
-/benchmarks/deployment.*/
-/benchmarks/soak.*/
-/benchmarks/.asset-cache/
-/fuzz/target/
-/artifacts/
-
-# Editor files
+/reality-rs/
+/xray-go
+/xray-go.exe
+/prototype/target/
 __pycache__/
-*.swp
-*.swo
-/.idea/
-/.vscode/
-/benchmarks/profile-validation/
-/benchmarks/profile-validation.*/
-
-# Transient diagnostic run output (bench pressure default)
-/diagnostics/
-
-# Review mirror: omit local benchmark evidence archives and captures.
-/benchmarks/evidence/
+*.pyc
+*.pem
+*.key
+.env

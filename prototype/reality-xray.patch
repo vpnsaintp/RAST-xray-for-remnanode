@@ -1,0 +1,174 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 80a3871..3d282b9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -106,7 +106,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features =
+   "fmt",
+   "std",
+ ] }
+-webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.7", features = [
++webpki = { package = "rustls-webpki", version = "=0.104.0-alpha.8", features = [
+   "alloc",
+ ], default-features = false }
+ webpki-roots = "1.0.9"
+diff --git a/rustls-aws-lc-rs/src/reality.rs b/rustls-aws-lc-rs/src/reality.rs
+index 3a1f0f9..77dec6e 100644
+--- a/rustls-aws-lc-rs/src/reality.rs
++++ b/rustls-aws-lc-rs/src/reality.rs
+@@ -94,8 +94,9 @@ impl ServerCredentialResolver for RealityServerCredentialResolver {
+             .provider
+             .key_provider
+             .load_private_key(private_key)?;
++        // Xray REALITY signs with Ed25519 even if the fingerprint omits it.
+         let signer = signing_key
+-            .choose_scheme(client_hello.signature_schemes())
++            .choose_scheme(&[SignatureScheme::ED25519])
+             .ok_or(Error::NoSuitableCertificate)?;
+         Ok(SelectedCredential::new(identity, signer))
+     }
+@@ -354,6 +355,7 @@ pub struct RealitySessionIdConfig {
+ #[derive(Debug, Clone)]
+ pub struct RealityServerVerifierConfig {
+     version: [u8; 3],
++    max_client_version: [u8; 3],
+     short_ids: Vec<Vec<u8>>,
+     server_private_key: Vec<u8>,
+     time_provider: Arc<dyn TimeProvider>,
+@@ -363,6 +365,7 @@ pub struct RealityServerVerifierConfig {
+ /// aws-lc-rs backed REALITY verifier for incoming TLS 1.3 client hellos.
+ pub struct AwsLcRsRealityClientHelloVerifier {
+     version: [u8; 3],
++    max_client_version: [u8; 3],
+     short_ids: Vec<[u8; 8]>,
+     short_id_lens: Vec<usize>,
+     server_private_key: Vec<u8>,
+@@ -532,6 +535,7 @@ impl RealityServerVerifierConfig {
+     pub fn new(version: [u8; 3], short_id: impl AsRef<[u8]>, server_private_key: Vec<u8>) -> Self {
+         Self {
+             version,
++            max_client_version: version,
+             short_ids: vec![short_id.as_ref().to_vec()],
+             server_private_key,
+             time_provider: Arc::new(DefaultTimeProvider),
+@@ -576,6 +580,13 @@ impl RealityServerVerifierConfig {
+         self
+     }
+ 
++    /// Sets the inclusive bounds of the authenticated Xray client version.
++    pub fn with_client_version_range(mut self, minimum: [u8; 3], maximum: [u8; 3]) -> Self {
++        self.version = minimum;
++        self.max_client_version = maximum;
++        self
++    }
++
+     /// Replaces the accepted Short ID with the configured Xray `shortIds` list.
+     pub fn with_short_ids<I, S>(mut self, short_ids: I) -> Self
+     where
+@@ -632,6 +643,7 @@ impl RealityServerVerifierConfig {
+         }
+         Ok(AwsLcRsRealityClientHelloVerifier {
+             version: self.version,
++            max_client_version: self.max_client_version,
+             short_ids: fixed_short_ids,
+             short_id_lens,
+             server_private_key: self.server_private_key.clone(),
+@@ -751,11 +763,7 @@ impl AwsLcRsRealityClientHelloVerifier {
+             ));
+         }
+ 
+-        if plaintext[..3]
+-            .ct_eq(&self.version)
+-            .unwrap_u8()
+-            != 1
+-        {
++        if plaintext[..3] < self.version[..] || plaintext[..3] > self.max_client_version[..] {
+             return Err(Error::General(
+                 "REALITY server verifier rejected an unexpected version tag".into(),
+             ));
+@@ -787,7 +795,9 @@ impl AwsLcRsRealityClientHelloVerifier {
+             .current_time()
+             .ok_or(Error::FailedToGetCurrentTime)?
+             .as_secs();
+-        if current_time.abs_diff(timestamp) > self.max_time_skew.as_secs() {
++        if !self.max_time_skew.is_zero()
++            && u128::from(current_time.abs_diff(timestamp)) * 1000 > self.max_time_skew.as_millis()
++        {
+             return Err(Error::General(
+                 "REALITY server verifier rejected a stale timestamp".into(),
+             ));
+@@ -829,6 +839,7 @@ impl ClientHelloVerifier for AwsLcRsRealityClientHelloVerifier {
+ 
+     fn hash_config(&self, h: &mut dyn Hasher) {
+         h.write(&self.version);
++        h.write(&self.max_client_version);
+         h.write_usize(self.short_ids.len());
+         for (short_id, short_id_len) in self
+             .short_ids
+diff --git a/rustls/src/webpki/client_verifier.rs b/rustls/src/webpki/client_verifier.rs
+index 1af822c..6a5ad61 100644
+--- a/rustls/src/webpki/client_verifier.rs
++++ b/rustls/src/webpki/client_verifier.rs
+@@ -313,7 +313,7 @@ impl WebPkiClientVerifier {
+         Self {
+             roots,
+             root_hint_subjects,
+-            eku_validator: ExtendedKeyUsage::client_auth(),
++            eku_validator: ExtendedKeyUsage::CLIENT_AUTH,
+             crls,
+             revocation_check_depth,
+             unknown_revocation_policy,
+@@ -353,18 +353,16 @@ impl ClientVerifier for WebPkiClientVerifier {
+             )
+         };
+ 
+-        cert.0
+-            .verify_for_usage(
+-                self.supported_algs.all,
+-                &self.roots.roots,
+-                &certificates.intermediates,
+-                identity.now,
+-                &self.eku_validator,
+-                revocation,
+-                None,
+-            )
+-            .map_err(pki_error)
+-            .map(|_| VerifiedIdentity::assertion(identity.identity.clone()))
++        webpki::PathBuilder::new(
++            &certificates.intermediates,
++            revocation,
++            &self.eku_validator,
++            self.supported_algs.all,
++            &self.roots.roots,
++        )
++        .build(&cert.0, identity.now)
++        .map_err(pki_error)
++        .map(|_| VerifiedIdentity::assertion(identity.identity.clone()))
+     }
+ 
+     fn verify_tls12_signature(
+diff --git a/rustls/src/webpki/verify.rs b/rustls/src/webpki/verify.rs
+index 67eca51..4c3d554 100644
+--- a/rustls/src/webpki/verify.rs
++++ b/rustls/src/webpki/verify.rs
+@@ -186,15 +186,14 @@ pub(crate) fn verify_identity_signed_by_trust_anchor_impl(
+     now: UnixTime,
+     supported_algs: &[&dyn SignatureVerificationAlgorithm],
+ ) -> Result<(), Error> {
+-    let result = cert.0.verify_for_usage(
+-        supported_algs,
+-        &roots.roots,
++    let result = webpki::PathBuilder::new(
+         intermediates,
+-        now,
+-        &ExtendedKeyUsage::server_auth(),
+         revocation,
+-        None,
+-    );
++        &ExtendedKeyUsage::SERVER_AUTH,
++        supported_algs,
++        &roots.roots,
++    )
++    .build(&cert.0, now);
+     match result {
+         Ok(_) => Ok(()),
+         Err(e) => Err(pki_error(e)),

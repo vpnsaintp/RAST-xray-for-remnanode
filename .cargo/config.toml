@@ -1,9 +1,0 @@
-# `cargo dev ...` is the canonical developer and CI entry point for repository
-# policy. The alias means nobody needs to know that the tool lives in a separate
-# workspace under tools/.
-#
-# `--locked` is load-bearing: without it, `cargo run` can rewrite tools/Cargo.lock
-# before `perf freeze` checks worktree cleanliness (Native Exact-head Class B).
-# See ADR 0056.
-[alias]
-dev = "run --quiet --locked --manifest-path tools/Cargo.toml --package rr-dev --"

@@ -1,0 +1,34 @@
+name: Rust проверки
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Загрузить исходники
+        uses: actions/checkout@v4
+      - name: Установить Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Получить закреплённую зависимость REALITY
+        run: |
+          git clone https://github.com/ssrlive/reality-rs.git reality-rs
+          git -C reality-rs checkout --detach e71b6c20b0860d9fa9589862e81fa8869ed4fa7a
+          git -C reality-rs apply --check ../prototype/reality-xray.patch
+          git -C reality-rs apply ../prototype/reality-xray.patch
+      - name: Проверить форматирование
+        working-directory: prototype
+        run: cargo fmt --all -- --check
+      - name: Собрать и выполнить Rust-тесты
+        working-directory: prototype
+        run: cargo test --locked --release
+      - name: Проверить синтаксис Python-тестов
+        run: python3 -m py_compile prototype/test_interop.py prototype/test_node_client.py prototype/test_remnawave.py

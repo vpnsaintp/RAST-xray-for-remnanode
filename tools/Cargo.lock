@@ -654,6 +654,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
 dependencies = [
  "async-trait",
+ "bytes",
  "cfg-if",
  "data-encoding",
  "futures-channel",
@@ -664,11 +665,14 @@ dependencies = [
  "ipnet",
  "jni",
  "rand",
+ "rustls",
  "thiserror",
  "tinyvec",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -706,10 +710,13 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "rand",
+ "rustls",
  "smallvec",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1896,6 +1903,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

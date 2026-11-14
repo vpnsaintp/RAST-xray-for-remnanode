@@ -31,14 +31,17 @@ for the original packaging decision.
 | `benchmarks/evidence/` | Compact durable evidence: acceptance manifests, checksummed golden objects, release evidence. |
 | `benches/` | Production Cargo benchmarks. |
 | `fuzz/` | Fuzz targets covering the externally reachable attack surface. |
+| `integrations/remnanode/` | Independently licensed RemnaNode adapter patch, license, and baseline provenance for the review snapshot. |
 | `tests/` | Integration validation for the production package. |
 | `deploy/` | Service packaging (systemd unit). |
 | `examples/` | Rust example consuming the library surface. |
 
 General human documentation belongs under `docs/` or in the standard root
-entry files. Two exact colocated ownership references are part of their owning
-trees: `benchmarks/README.md` defines the benchmark-data categories and
-`tools/reference/README.md` defines the independent comparator boundary.
+entry files. `REVIEW.md` records the source-review snapshot's provenance and
+unverified gates. Three exact colocated ownership references are part of their
+owning trees: `benchmarks/README.md` defines the benchmark-data categories,
+`integrations/remnanode/README.md` records the adapter patch's provenance,
+and `tools/reference/README.md` defines the independent comparator boundary.
 Markdown below `benchmarks/evidence/` is durable evidence, not a second
 documentation hierarchy.
 

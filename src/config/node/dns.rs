@@ -2,6 +2,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 /// Resolvers and the shared resolution cache.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Serialize)]
@@ -15,7 +16,10 @@ pub struct DnsConfig {
     /// resolver, where each entry is an address (`1.1.1.1`,
     /// `[2606:4700:4700::1111]:53`) or a hostname resolved once through the
     /// system resolver at startup, with an optional `:port` defaulting to 53.
-    /// UDP is used, falling back to TCP on truncation.
+    /// UDP is used, falling back to TCP on truncation. An encrypted upstream
+    /// uses `tls://server-name/numeric-ip[:port]`, for example
+    /// `tls://dns.google/8.8.8.8:853`. The name authenticates the TLS peer;
+    /// the numeric address avoids an unbound bootstrap DNS lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub servers: Option<Vec<String>>,
     /// Deadline for one resolution attempt, in milliseconds. Absent means 5000.
@@ -32,6 +36,64 @@ pub const SYSTEM_RESOLVER: &str = "system";
 
 /// The default resolution deadline, in milliseconds.
 pub const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
+
+/// One explicit DNS-over-TLS peer. The numeric endpoint is separate from the
+/// TLS identity so a dual-IP node can bind the resolver socket before dialing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DotServerSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) address: SocketAddr,
+}
+
+/// Parse only DNS-over-TLS entries. `None` means that the ordinary DNS parser
+/// owns the entry; a malformed `tls://` entry is always an error.
+pub(crate) fn parse_dot_server_spec(spec: &str) -> Result<Option<DotServerSpec<'_>>, &'static str> {
+    let Some(rest) = spec.strip_prefix("tls://") else {
+        return Ok(None);
+    };
+    let (name, endpoint) = rest
+        .split_once('/')
+        .ok_or("DNS-over-TLS requires tls://server-name/numeric-ip[:port]")?;
+    if name.is_empty() || name.len() > 253 || name.ends_with('.') {
+        return Err("DNS-over-TLS server name must be an ASCII DNS name");
+    }
+    for label in name.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("DNS-over-TLS server name must be an ASCII DNS name");
+        }
+    }
+    if endpoint.is_empty() || endpoint.contains('/') {
+        return Err("DNS-over-TLS endpoint must be a numeric IP address and optional port");
+    }
+    let address = if let Some(ipv6) = endpoint
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        SocketAddr::new(
+            ipv6.parse::<Ipv6Addr>()
+                .map_err(|_| "invalid DNS-over-TLS IPv6 address")?
+                .into(),
+            853,
+        )
+    } else if let Ok(ip) = endpoint.parse::<IpAddr>() {
+        SocketAddr::new(ip, 853)
+    } else {
+        endpoint
+            .parse::<SocketAddr>()
+            .map_err(|_| "DNS-over-TLS endpoint must be a numeric IP address and optional port")?
+    };
+    if address.port() == 0 {
+        return Err("DNS-over-TLS port must be greater than zero");
+    }
+    Ok(Some(DotServerSpec { name, address }))
+}
 
 impl DnsConfig {
     /// The configured resolvers, applying the system-resolver default.

@@ -197,8 +197,12 @@ literals never enter it. Two backends sit behind one front end:
   singleflight coalescing, the absolute timeout, and admission governance
   apply.
 - **upstream list**: the built-in DNS protocol resolver (hickory, plain UDP
-  with TCP fallback) against the configured servers, bootstrapping hostname
-  entries once through the system resolver at startup. Cached positive and
+  with TCP fallback or certificate-verified DNS over TLS) against the
+  configured servers. Plain hostname entries bootstrap once through the
+  system resolver at startup. TLS entries use
+  `tls://server-name/numeric-ip[:port]` (default port 853), such as
+  `tls://dns.google/8.8.8.8`; the separate numeric endpoint avoids bootstrap
+  leakage on a node with `network.directSourceIp`. Cached positive and
   negative answers carry real upstream TTLs clamped to `dns.cache`
   (`minTtlSeconds`/`maxTtlSeconds`; negatives are cached only when an SOA TTL
   backs them, ceiling `negativeTtlSeconds`). Mixing `system` with upstream

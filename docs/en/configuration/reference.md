@@ -62,10 +62,19 @@ Cold. Several listeners may share a family but not a socket.
 | `ip` | `"auto"` \| `"dualStack"` \| `"ipv4Only"` \| `"ipv6Only"` | no | `"auto"` |
 | `ipv4` | string | no | the IPv4 wildcard `0.0.0.0` |
 | `ipv6` | string | no | the IPv6 wildcard `::` |
+| `proxyProtocol` | `"v1"` | no | no PROXY prelude |
+| `trustedProxyIp` | IPv4 string | no | only loopback HAProxy may send PROXY v1 |
 
 `auto` binds both families and starts if at least one succeeds. `dualStack`
 requires both. `ipv4` and `ipv6` name a concrete address to bind instead of
 the wildcard, and are used only for a family that is being bound at all.
+
+`proxyProtocol` is only valid on one `entry` listener with `ip: "ipv4Only"`.
+For local HAProxy, bind `127.0.0.1` and omit `trustedProxyIp`. For a remote
+HAProxy, bind an explicit non-loopback IPv4 and set `trustedProxyIp` to the
+exact address seen as the TCP peer. Firewall the listener so only that peer
+can reach it. The PROXY header supplies the attributed client IP; it is not
+authenticated by itself. Client and landing listeners reject both fields.
 
 ## Reality
 

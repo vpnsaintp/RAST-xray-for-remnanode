@@ -11,7 +11,7 @@
 //! `dns.cache.systemReuseMs` recent-completion window is the bounded
 //! exception); it still gains coalescing, governance, and the absolute
 //! timeout. The DNS protocol backend (hickory, plain UDP with TCP fallback
-//! against the configured servers) observes real TTLs and caches only
+//! or certificate-verified DNS over TLS) observes real TTLs and caches only
 //! TTL-backed answers. Static configured peers are the explicit exception in
 //! every mode: the operator owns their staleness through
 //! `dns.cache.staticTtlSeconds`.
@@ -55,7 +55,7 @@ use tokio::{
     time::{self, Instant},
 };
 
-use crate::config::node::dns::{DnsCacheConfig, DnsConfig};
+use crate::config::node::dns::{DnsCacheConfig, DnsConfig, parse_dot_server_spec};
 use crate::runtime::policy::ResourceGovernorPolicy;
 use crate::runtime::{AdmissionKind, AdmissionPermit, ResourceGovernor};
 
@@ -239,7 +239,7 @@ fn system_lookup(name: &str) -> Result<UpstreamAnswer, UpstreamError> {
     Ok(UpstreamAnswer { ips, ttl: None })
 }
 
-/// Real DNS over plain UDP with TCP fallback, observing upstream TTLs.
+/// Real DNS over configured plain UDP/TCP or TLS peers, observing upstream TTLs.
 struct HickoryBackend {
     resolver: TokioResolver,
 }
@@ -545,6 +545,19 @@ impl DnsResolver {
                         return Err(DnsResolverConfigError::SourceNeedsNumericDns);
                     }
                     servers.push(name_server_config_with_source(address, source_ip));
+                }
+                DnsServerSpec::Tls {
+                    address,
+                    server_name,
+                } => {
+                    if source_ip.is_some() && !address.is_ipv4() {
+                        return Err(DnsResolverConfigError::SourceNeedsNumericDns);
+                    }
+                    servers.push(tls_name_server_config_with_source(
+                        address,
+                        &server_name,
+                        source_ip,
+                    ));
                 }
                 DnsServerSpec::Host { host, port } => {
                     if source_ip.is_some() {
@@ -879,6 +892,13 @@ pub enum DnsServerSpec {
     System,
     /// An upstream DNS server socket address.
     Address(SocketAddr),
+    /// A certificate-verified DNS-over-TLS endpoint with no bootstrap lookup.
+    Tls {
+        /// Numeric upstream address.
+        address: SocketAddr,
+        /// DNS name used for TLS peer authentication.
+        server_name: String,
+    },
     /// An upstream DNS server hostname, resolved once through the system
     /// resolver at startup.
     Host {
@@ -892,14 +912,22 @@ pub enum DnsServerSpec {
 /// Parses one `dns.servers` entry without performing any network I/O.
 ///
 /// Accepted forms: `system`, an IP literal (port 53), a socket address
-/// (`1.1.1.1:53`, `[2606:4700:4700::1111]:853`), or a hostname with an
-/// optional `:port`.
+/// (`1.1.1.1:53`, `[2606:4700:4700::1111]:853`), a hostname with an
+/// optional `:port`, or `tls://server-name/numeric-ip[:port]` (port 853).
 ///
 /// # Errors
 ///
 /// Returns [`DnsServerSpecError`] describing the syntax violation.
 pub fn parse_server_spec(spec: &str) -> Result<DnsServerSpec, DnsServerSpecError> {
     let spec = spec.trim();
+    if let Some(dot) =
+        parse_dot_server_spec(spec).map_err(|reason| DnsServerSpecError::new(spec, reason))?
+    {
+        return Ok(DnsServerSpec::Tls {
+            address: dot.address,
+            server_name: dot.name.to_owned(),
+        });
+    }
     if spec == "system" {
         return Ok(DnsServerSpec::System);
     }
@@ -1070,6 +1098,19 @@ fn name_server_config_with_source(
         tcp.bind_addr = bind;
     }
     NameServerConfig::new(address.ip(), true, vec![udp, tcp])
+}
+
+fn tls_name_server_config_with_source(
+    address: SocketAddr,
+    server_name: &str,
+    source_ip: Option<Ipv4Addr>,
+) -> NameServerConfig {
+    let mut tls = ConnectionConfig::tls(Arc::from(server_name));
+    tls.port = address.port();
+    if let Some(source_ip) = source_ip {
+        tls.bind_addr = Some(SocketAddr::new(IpAddr::V4(source_ip), 0));
+    }
+    NameServerConfig::new(address.ip(), true, vec![tls])
 }
 
 /// The process-lifetime shared resolver, installed once at startup.

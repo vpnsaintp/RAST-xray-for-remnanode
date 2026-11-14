@@ -58,9 +58,17 @@
 | `ip` | `"auto"` \| `"dualStack"` \| `"ipv4Only"` \| `"ipv6Only"` | 否 | `"auto"` |
 | `ipv4` | string | 否 | IPv4 通配地址 `0.0.0.0` |
 | `ipv6` | string | 否 | IPv6 通配地址 `::` |
+| `proxyProtocol` | `"v1"` | 否 | 不读取 PROXY 前缀 |
+| `trustedProxyIp` | IPv4 string | 否 | 仅信任本机 HAProxy |
 
 `auto` 绑定两个地址族，至少一个成功就启动。`dualStack` 要求都成功。`ipv4` 和 `ipv6`
 用来指定具体绑定地址而不是通配地址，且只对确实要绑定的那个族生效。
+
+`proxyProtocol` 仅适用于单个 `entry` 监听器，且必须设置 `ip: "ipv4Only"`。
+本机 HAProxy 应绑定 `127.0.0.1` 并省略 `trustedProxyIp`。远端 HAProxy
+必须使用明确的非本机 IPv4 绑定地址，并将 `trustedProxyIp` 设为实际 TCP
+对端地址。防火墙必须只允许该地址访问监听端口。PROXY 报文本身不提供认证；
+`client` 和 `landing` 监听器不接受这两个字段。
 
 ## Reality
 

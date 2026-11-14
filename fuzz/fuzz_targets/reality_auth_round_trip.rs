@@ -50,14 +50,14 @@ fuzz_target!(|input: &[u8]| {
         .expect("synthetic REALITY transcript must authenticate");
     assert_eq!(authenticated.client_version(), spec.client_version);
     assert_eq!(authenticated.client_time(), spec.client_time);
-    assert_eq!(authenticated.user_id(), transcript.owner);
+    assert!(authenticated.users().contains(transcript.owner));
 
     // Ownership is authoritative: a VLESS UUID from a different user must fail
     // before Addons, command, or destination validation.
     let mismatch = UserId::new(spec.other_owner);
     if mismatch != transcript.owner {
         assert_eq!(
-            fuzz_validate_short_id_owner(mismatch, authenticated.user_id()),
+            fuzz_validate_short_id_owner(mismatch, authenticated.users()),
             Err(RequestValidationError::ShortIdOwnerMismatch)
         );
     }

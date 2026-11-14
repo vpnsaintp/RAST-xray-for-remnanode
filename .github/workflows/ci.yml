@@ -226,6 +226,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact source head
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - name: Install Rust toolchain
         run: rustup toolchain install
@@ -253,6 +259,15 @@ jobs:
             exit 1
           fi
           "$binary" --version | grep -E '^rust-reality [0-9]+\.[0-9]+\.[0-9]+$'
+          "$binary" --version | grep -Fx "commit: ${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Retain exact-head musl test binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-reality-musl-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/x86_64-musl/x86_64-unknown-linux-musl/release/rust-reality
+          if-no-files-found: error
+          retention-days: 7
 
   aarch64-native:
     name: aarch64 native candidate package

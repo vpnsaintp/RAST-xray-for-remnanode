@@ -167,6 +167,13 @@ bench = false
 members = ["."]
 
 [[bin]]
+name = "dns_server_spec"
+path = "fuzz_targets/dns_server_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nested_tls_prefix"
 path = "fuzz_targets/nested_tls_prefix.rs"
 test = false

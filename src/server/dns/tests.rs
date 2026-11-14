@@ -19,6 +19,7 @@ use hickory_resolver::{
 use super::{
     DnsBackend, DnsCacheConfig, DnsError, DnsResolver, DnsServerSpec, IpFamily, UpstreamAnswer,
     UpstreamError, classify_net_error, name_server_config_with_source, parse_server_spec,
+    tls_name_server_config_with_source,
 };
 use crate::config::node::dns::DnsConfig;
 use crate::runtime::ResourceGovernor;
@@ -33,11 +34,20 @@ fn dual_ip_dns_requires_literal_ipv4_and_binds_udp_and_tcp() {
     for connection in &server.connections {
         assert_eq!(connection.bind_addr, Some((source, 0).into()));
     }
+    let tls = tls_name_server_config_with_source(
+        "1.1.1.1:853".parse().expect("numeric TLS server"),
+        "cloudflare-dns.com",
+        Some(source),
+    );
+    assert_eq!(tls.connections.len(), 1);
+    assert_eq!(tls.connections[0].bind_addr, Some((source, 0).into()));
+    assert_eq!(tls.connections[0].port, 853);
     let governor = || ResourceGovernor::new(&ResourceGovernorPolicy::default());
     for servers in [
         vec!["system".to_owned()],
         vec!["dns.example.test".to_owned()],
         vec!["[2001:4860:4860::8888]:53".to_owned()],
+        vec!["tls://dns.google/[2001:4860:4860::8888]".to_owned()],
     ] {
         let config = DnsConfig {
             servers: Some(servers),
@@ -45,6 +55,11 @@ fn dual_ip_dns_requires_literal_ipv4_and_binds_udp_and_tcp() {
         };
         assert!(DnsResolver::from_config_with_source(&config, governor(), Some(source)).is_err());
     }
+    let config = DnsConfig {
+        servers: Some(vec!["tls://dns.google/8.8.8.8".to_owned()]),
+        ..DnsConfig::default()
+    };
+    assert!(DnsResolver::from_config_with_source(&config, governor(), Some(source)).is_ok());
 }
 
 #[test]
@@ -283,6 +298,36 @@ fn parses_server_spec_forms() {
             port: 853
         })
     );
+    assert_eq!(
+        parse_server_spec("tls://dns.google/8.8.8.8"),
+        Ok(DnsServerSpec::Tls {
+            address: SocketAddr::from(([8, 8, 8, 8], 853)),
+            server_name: "dns.google".to_owned(),
+        })
+    );
+    assert_eq!(
+        parse_server_spec("tls://dns.google/8.8.4.4:8853"),
+        Ok(DnsServerSpec::Tls {
+            address: SocketAddr::from(([8, 8, 4, 4], 8853)),
+            server_name: "dns.google".to_owned(),
+        })
+    );
+    assert_eq!(
+        parse_server_spec("tls://dns.google/[2001:4860:4860::8888]"),
+        Ok(DnsServerSpec::Tls {
+            address: SocketAddr::new("2001:4860:4860::8888".parse().expect("v6 literal"), 853),
+            server_name: "dns.google".to_owned(),
+        })
+    );
+    for invalid in [
+        "tls://dns.google",
+        "tls://bad_name/8.8.8.8",
+        "tls://dns.google/example.com",
+        "tls://dns.google/8.8.8.8:0",
+        "tls://dns.google/8.8.8.8/extra",
+    ] {
+        assert!(parse_server_spec(invalid).is_err(), "{invalid}");
+    }
     assert!(parse_server_spec("").is_err());
     assert!(parse_server_spec("example.com:0").is_err());
     assert!(parse_server_spec("example.com:nope").is_err());

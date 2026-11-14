@@ -99,6 +99,9 @@ impl RuntimeSnapshot {
             proxy_protocol_v1: config
                 .as_entry()
                 .is_some_and(|entry| entry.listeners[0].proxy_protocol.is_some()),
+            trusted_proxy_ip: config
+                .as_entry()
+                .and_then(|entry| entry.listeners[0].trusted_proxy_ip),
             _retirement: GenerationRetirement {
                 generation,
                 logger: logger.clone(),
@@ -225,6 +228,7 @@ pub(super) struct ConnectionRuntime {
     pub(super) governor: ResourceGovernor,
     pub(super) handler: ConnectionHandler,
     pub(super) proxy_protocol_v1: bool,
+    pub(super) trusted_proxy_ip: Option<std::net::Ipv4Addr>,
     // Declared last so the event follows handler destruction. Connections keep
     // this Arc after releasing the configuration snapshot that selected it.
     _retirement: GenerationRetirement,

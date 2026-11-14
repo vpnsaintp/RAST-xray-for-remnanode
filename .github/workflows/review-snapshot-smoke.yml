@@ -26,5 +26,9 @@ jobs:
         run: cargo check --workspace --locked
       - name: Test DNS implementation
         run: cargo test --lib --locked server::dns::tests -- --test-threads=1
+      - name: Test trusted PROXY protocol entry
+        run: |
+          cargo test --lib --locked server::production::proxy_protocol::tests -- --test-threads=1
+          cargo test --lib --locked config::semantics::tests::remote_proxy_v1_requires_exact_source_and_explicit_bind -- --test-threads=1
       - name: Test repository path policy
         run: cargo test --manifest-path tools/Cargo.toml -p rr-dev --locked repo::policy

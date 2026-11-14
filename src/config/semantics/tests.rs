@@ -131,13 +131,19 @@ fn remote_proxy_v1_requires_exact_source_and_explicit_bind() {
         r#""port": 443, "ip": "ipv4Only", "ipv4": "198.51.100.83", "proxyProtocol": "v1", "trustedProxyIp": "0.0.0.0""#,
         r#""port": 443, "ip": "ipv4Only", "ipv4": "198.51.100.83", "proxyProtocol": "v1", "trustedProxyIp": "127.0.0.1""#,
     ] {
-        assert_eq!(reject(&base.replace(r#""port": 443"#, listener)).path(), "listeners[0].proxyProtocol");
+        assert_eq!(
+            reject(&base.replace(r#""port": 443"#, listener)).path(),
+            "listeners[0].proxyProtocol"
+        );
     }
     let without_protocol = base.replace(
         r#""port": 443"#,
         r#""port": 443, "trustedProxyIp": "198.51.100.241""#,
     );
-    assert_eq!(reject(&without_protocol).path(), "listeners[0].trustedProxyIp");
+    assert_eq!(
+        reject(&without_protocol).path(),
+        "listeners[0].trustedProxyIp"
+    );
 }
 
 #[test]

@@ -77,6 +77,7 @@ impl LandingV18 {
                 protocol: None,
                 line_group: None,
                 proxy_protocol: None,
+                trusted_proxy_ip: None,
             }],
             landing: LandingProtocol::Handoff(HandoffLandingConfig {
                 udp_port: None,

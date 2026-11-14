@@ -46,10 +46,15 @@ pub struct ListenerConfig {
     /// Entry and landing reject this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_group: Option<String>,
-    /// Trust a local HAProxy to prepend one PROXY protocol v1 line before TLS.
-    /// Only valid for a single IPv4 loopback entry listener.
+    /// Trust HAProxy to prepend one PROXY protocol v1 line before TLS.
+    /// Only valid for a single IPv4 entry listener; remote trust requires
+    /// `trustedProxyIp` and a dedicated firewall allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<ProxyProtocol>,
+    /// Exact remote HAProxy source address allowed to assert the client IP.
+    /// Omit for a loopback-only HAProxy listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_proxy_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, JsonSchema, Serialize)]

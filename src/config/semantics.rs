@@ -143,6 +143,12 @@ pub fn validate(node: NodeConfig) -> Result<ValidatedConfig, SemanticError> {
 fn validate_client(client: &ClientConfig) -> Result<(), SemanticError> {
     validate_listeners(&client.listeners)?;
     for (index, listener) in client.listeners.iter().enumerate() {
+        if listener.trusted_proxy_ip.is_some() {
+            return fail(
+                format!("listeners[{index}].trustedProxyIp"),
+                "trustedProxyIp is only valid on entry listeners",
+            );
+        }
         if listener.proxy_protocol.is_some() {
             return fail(
                 format!("listeners[{index}].proxyProtocol"),
@@ -318,15 +324,26 @@ fn validate_entry(entry: &EntryConfig) -> Result<(), SemanticError> {
     validate_listeners(&entry.listeners)?;
     reject_client_only_protocol(&entry.listeners)?;
     for (index, listener) in entry.listeners.iter().enumerate() {
-        if listener.proxy_protocol.is_some()
-            && (entry.listeners.len() != 1
-                || listener.family() != crate::config::node::listener::ListenFamily::Ipv4Only
-                || listener.ipv4 != Some(std::net::Ipv4Addr::LOCALHOST))
-        {
+        if listener.trusted_proxy_ip.is_some() && listener.proxy_protocol.is_none() {
             return fail(
-                format!("listeners[{index}].proxyProtocol"),
-                "PROXY v1 requires a single entry listener bound to 127.0.0.1 with ipv4Only",
+                format!("listeners[{index}].trustedProxyIp"),
+                "trustedProxyIp requires proxyProtocol v1",
             );
+        }
+        if listener.proxy_protocol.is_some() {
+            let valid_local = listener.trusted_proxy_ip.is_none()
+                && listener.ipv4 == Some(std::net::Ipv4Addr::LOCALHOST);
+            let valid_remote = listener.trusted_proxy_ip.is_some_and(valid_remote_ipv4)
+                && listener.ipv4.is_some_and(valid_remote_ipv4);
+            if entry.listeners.len() != 1
+                || listener.family() != crate::config::node::listener::ListenFamily::Ipv4Only
+                || !(valid_local || valid_remote)
+            {
+                return fail(
+                    format!("listeners[{index}].proxyProtocol"),
+                    "PROXY v1 requires a single ipv4Only entry listener bound to 127.0.0.1 or an explicit IPv4 with trustedProxyIp",
+                );
+            }
         }
     }
     validate_reality(entry)?;
@@ -344,6 +361,13 @@ fn validate_entry(entry: &EntryConfig) -> Result<(), SemanticError> {
     validate_log(entry.log.as_ref())?;
     validate_runtime(entry.runtime.as_ref())?;
     validate_key_independence(entry_key_material(entry))
+}
+
+fn valid_remote_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && ip != std::net::Ipv4Addr::BROADCAST
 }
 
 fn validate_reality(entry: &EntryConfig) -> Result<(), SemanticError> {
@@ -589,6 +613,12 @@ fn validate_landing(landing: &LandingConfig) -> Result<(), SemanticError> {
     validate_listeners(&landing.listeners)?;
     reject_client_only_protocol(&landing.listeners)?;
     for (index, listener) in landing.listeners.iter().enumerate() {
+        if listener.trusted_proxy_ip.is_some() {
+            return fail(
+                format!("listeners[{index}].trustedProxyIp"),
+                "trustedProxyIp is only valid on entry listeners",
+            );
+        }
         if listener.proxy_protocol.is_some() {
             return fail(
                 format!("listeners[{index}].proxyProtocol"),

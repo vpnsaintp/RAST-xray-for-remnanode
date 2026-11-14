@@ -118,6 +118,29 @@ fn proxy_v1_requires_one_ipv4_loopback_entry_listener() {
 }
 
 #[test]
+fn remote_proxy_v1_requires_exact_source_and_explicit_bind() {
+    let base = entry_json("");
+    let valid = base.replace(
+        r#""port": 443"#,
+        r#""port": 443, "ip": "ipv4Only", "ipv4": "198.51.100.83", "proxyProtocol": "v1", "trustedProxyIp": "198.51.100.241""#,
+    );
+    accept(&valid);
+    for listener in [
+        r#""port": 443, "ip": "ipv4Only", "ipv4": "198.51.100.83", "proxyProtocol": "v1""#,
+        r#""port": 443, "ip": "ipv4Only", "ipv4": "0.0.0.0", "proxyProtocol": "v1", "trustedProxyIp": "198.51.100.241""#,
+        r#""port": 443, "ip": "ipv4Only", "ipv4": "198.51.100.83", "proxyProtocol": "v1", "trustedProxyIp": "0.0.0.0""#,
+        r#""port": 443, "ip": "ipv4Only", "ipv4": "198.51.100.83", "proxyProtocol": "v1", "trustedProxyIp": "127.0.0.1""#,
+    ] {
+        assert_eq!(reject(&base.replace(r#""port": 443"#, listener)).path(), "listeners[0].proxyProtocol");
+    }
+    let without_protocol = base.replace(
+        r#""port": 443"#,
+        r#""port": 443, "trustedProxyIp": "198.51.100.241""#,
+    );
+    assert_eq!(reject(&without_protocol).path(), "listeners[0].trustedProxyIp");
+}
+
+#[test]
 fn two_listeners_may_share_a_family_but_not_a_socket() {
     accept(&format!(
         r#"{{"role":"entry","listeners":[{{"port":443}},{{"port":8443}}],

@@ -101,6 +101,7 @@ struct ListenerTopology {
     protocol: ListenerRole,
     mode: ListenFamily,
     proxy_protocol_v1: bool,
+    trusted_proxy_ip: Option<std::net::Ipv4Addr>,
 }
 
 fn listener_topology(node: &NodeConfig) -> HashMap<SocketAddr, ListenerTopology> {
@@ -122,6 +123,7 @@ fn listener_topology(node: &NodeConfig) -> HashMap<SocketAddr, ListenerTopology>
                 protocol,
                 mode: listener.family(),
                 proxy_protocol_v1: listener.proxy_protocol.is_some(),
+                trusted_proxy_ip: listener.trusted_proxy_ip,
             };
             listener
                 .bind_addresses()

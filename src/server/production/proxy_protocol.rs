@@ -1,11 +1,11 @@
-//! Bounded PROXY protocol v1 prelude for a loopback-only entry listener.
+//! Bounded PROXY protocol v1 prelude for an explicitly trusted HAProxy.
 //!
 //! The header is authoritative only when it arrives on the explicitly
-//! configured local HAProxy socket. No direct TLS is accepted in that mode.
+//! configured HAProxy peer. No direct TLS is accepted in that mode.
 
 use std::{
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -17,8 +17,13 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) async fn read_v1(
     stream: &mut TcpStream,
     physical_peer: SocketAddr,
+    trusted_proxy_ip: Option<Ipv4Addr>,
 ) -> io::Result<SocketAddr> {
-    if !physical_peer.ip().is_loopback() {
+    let trusted = match trusted_proxy_ip {
+        Some(ip) => physical_peer.ip() == IpAddr::V4(ip),
+        None => physical_peer.ip().is_loopback(),
+    };
+    if !trusted {
         return Err(invalid());
     }
     timeout(HEADER_TIMEOUT, read_line(stream))
@@ -107,7 +112,7 @@ mod tests {
             stream.write_all(&bytes).await.unwrap();
         });
         let (mut inbound, peer) = listener.accept().await?;
-        let result = read_v1(&mut inbound, peer).await;
+        let result = read_v1(&mut inbound, peer, None).await;
         let mut remainder = Vec::new();
         if result.is_ok() {
             inbound.read_to_end(&mut remainder).await?;
@@ -146,6 +151,35 @@ mod tests {
         let _sender = TcpStream::connect(address).await.unwrap();
         let (mut inbound, _) = listener.accept().await.unwrap();
         let false_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 1234);
-        assert!(read_v1(&mut inbound, false_peer).await.is_err());
+        assert!(read_v1(&mut inbound, false_peer, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_header_requires_exact_trusted_transport_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let header = b"PROXY TCP4 198.51.100.7 198.51.100.83 43210 443\r\n";
+        let sender = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(header).await.unwrap();
+        });
+        let (mut inbound, _) = listener.accept().await.unwrap();
+        let bridge = Ipv4Addr::new(198, 51, 100, 241);
+        let peer = SocketAddr::new(IpAddr::V4(bridge), 54321);
+        assert_eq!(
+            read_v1(&mut inbound, peer, Some(bridge))
+                .await
+                .unwrap()
+                .to_string(),
+            "198.51.100.7:43210"
+        );
+        sender.await.unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _sender = TcpStream::connect(address).await.unwrap();
+        let (mut inbound, _) = listener.accept().await.unwrap();
+        let impostor = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 242)), 54321);
+        assert!(read_v1(&mut inbound, impostor, Some(bridge)).await.is_err());
     }
 }

@@ -42,7 +42,7 @@ pub(super) async fn run_connection(
         match &state.handler {
             ConnectionHandler::Public { reality, vision } => {
                 let attributed_peer = if state.proxy_protocol_v1 {
-                    proxy_protocol::read_v1(&mut stream, peer)
+                    proxy_protocol::read_v1(&mut stream, peer, state.trusted_proxy_ip)
                         .await
                         .map_err(ConnectionRunError::ProxyProtocol)?
                 } else {

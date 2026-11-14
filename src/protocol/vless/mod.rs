@@ -33,14 +33,14 @@ pub(crate) use validate::validate_authenticated_vision_fields;
 #[doc(hidden)]
 pub fn fuzz_validate_short_id_owner(
     request_user_id: UserId,
-    authenticated_user_id: UserId,
+    authenticated_users: &AuthenticatedUsers,
 ) -> Result<(), RequestValidationError> {
     validate_authenticated_vision_fields(
         request_user_id,
         &[],
         Command::Tcp,
         true,
-        &AuthenticatedUsers::Exclusive(authenticated_user_id),
+        authenticated_users,
     )
 }
 pub use validate::{

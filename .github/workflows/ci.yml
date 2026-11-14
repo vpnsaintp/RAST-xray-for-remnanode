@@ -254,6 +254,14 @@ jobs:
           fi
           "$binary" --version | grep -E '^rust-reality [0-9]+\.[0-9]+\.[0-9]+$'
 
+      - name: Retain exact-head musl test binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-reality-musl-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/x86_64-musl/x86_64-unknown-linux-musl/release/rust-reality
+          if-no-files-found: error
+          retention-days: 7
+
   aarch64-native:
     name: aarch64 native candidate package
     runs-on: ubuntu-22.04-arm

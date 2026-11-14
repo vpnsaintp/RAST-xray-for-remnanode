@@ -26,7 +26,9 @@ jobs:
         working-directory: source/prototype
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo test --locked --release -j 2
+        run: |
+          cargo test --locked --release -j 2
+          cargo build --locked --release -j 2
       - name: Проверить бинарник
         run: |
           file source/prototype/target/release/nightvpn-xray-rust-prototype

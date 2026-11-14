@@ -1,0 +1,40 @@
+name: Проверка Rust ядра коллеги
+
+on:
+  push:
+    branches: [experiment/colleague-core-20261114]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Установить Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Получить закреплённые исходники
+        run: |
+          git clone https://github.com/wsq222222/xray-fork.git source
+          git -C source checkout --detach a23823b560cb3e02353b307ac48007d7f68058fa
+          git clone https://github.com/ssrlive/reality-rs.git source/reality-rs
+          git -C source/reality-rs checkout --detach e71b6c20b0860d9fa9589862e81fa8869ed4fa7a
+          git -C source/reality-rs apply --check ../prototype/reality-xray.patch
+          git -C source/reality-rs apply ../prototype/reality-xray.patch
+      - name: Собрать и запустить тесты
+        working-directory: source/prototype
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test --locked --release -j 2
+      - name: Проверить бинарник
+        run: |
+          file source/prototype/target/release/nightvpn-xray-rust-prototype
+          sha256sum source/prototype/target/release/nightvpn-xray-rust-prototype
+      - name: Сохранить тестовый бинарник
+        uses: actions/upload-artifact@v4
+        with:
+          name: colleague-rust-a23823b
+          path: source/prototype/target/release/nightvpn-xray-rust-prototype
+          if-no-files-found: error
+          retention-days: 1

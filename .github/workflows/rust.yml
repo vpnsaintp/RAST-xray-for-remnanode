@@ -22,8 +22,8 @@ jobs:
         run: |
           git clone https://github.com/ssrlive/reality-rs.git reality-rs
           git -C reality-rs checkout --detach e71b6c20b0860d9fa9589862e81fa8869ed4fa7a
-          git -C reality-rs apply --check ../prototype/reality-xray.patch
-          git -C reality-rs apply ../prototype/reality-xray.patch
+          git -C reality-rs apply --recount --ignore-space-change --ignore-whitespace --check ../prototype/reality-xray.patch
+          git -C reality-rs apply --recount --ignore-space-change --ignore-whitespace ../prototype/reality-xray.patch
       - name: Проверить форматирование
         working-directory: prototype
         run: cargo fmt --all -- --check

@@ -281,9 +281,9 @@ async fn open(
                 flow.peer.ip(),
             );
             let sender = match route.egress {
-                Egress::Direct(_) => {
+                Egress::Direct(ref direct) => {
                     let addr = *route.addresses.first().context("no UDP destination")?;
-                    let socket = udp_socket(addr).await?;
+                    let socket = Arc::new(direct.udp_socket(addr).await?);
                     tasks.spawn(receive_udp(
                         socket.clone(),
                         None,

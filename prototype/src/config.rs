@@ -41,12 +41,17 @@ pub enum Transport {
         tls: Arc<ServerConfig>,
         verifier: Arc<VerifyServerName>,
         fallback: Option<RealityTarget>,
+        fallback_proxy_version: u8,
         xhttp: Option<Arc<crate::xhttp::Settings>>,
         grpc: Option<Arc<crate::grpc::Settings>>,
     },
     Grpc(crate::grpc::Settings),
     Tls(Arc<ServerConfig>),
     WebSocket(crate::ws::Settings),
+    WebSocketTls {
+        tls: Arc<ServerConfig>,
+        settings: crate::ws::Settings,
+    },
 }
 
 pub struct Config {
@@ -133,6 +138,10 @@ struct StreamSettings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InboundTlsSettings {
     certificates: Vec<InboundTlsCertificate>,
+    // Xray accepts serverName on inbound TLS. With a single certificate it
+    // does not affect certificate selection; retain strict parsing elsewhere.
+    #[serde(default)]
+    server_name: String,
     #[serde(default)]
     min_version: String,
     #[serde(default)]
@@ -152,6 +161,7 @@ struct InboundTlsCertificate {
 
 impl InboundTlsSettings {
     fn compile(mut self) -> Result<Arc<ServerConfig>> {
+        let _ = &self.server_name;
         let provider = match (self.min_version.as_str(), self.max_version.as_str()) {
             ("" | "1.2", "" | "1.3") => DEFAULT_PROVIDER,
             ("" | "1.2", "1.2") => DEFAULT_TLS12_PROVIDER,
@@ -188,7 +198,6 @@ impl InboundTlsSettings {
         Ok(Arc::new(tls))
     }
 }
-
 fn tls_pem(inline: Option<Vec<String>>, path: Option<PathBuf>) -> Result<Vec<u8>> {
     match (inline, path) {
         (Some(lines), None) => Ok(lines.join("\n").into_bytes()),
@@ -196,7 +205,6 @@ fn tls_pem(inline: Option<Vec<String>>, path: Option<PathBuf>) -> Result<Vec<u8>
         _ => bail!("expected exactly one source for inbound TLS PEM"),
     }
 }
-
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SocketOptions {
@@ -234,11 +242,14 @@ struct RealitySettings {
     max_client_ver: String,
     #[serde(default)]
     max_time_diff: u64,
+    #[serde(default, rename = "spiderX")]
+    _spider_x: String,
 }
 
 pub enum RealityTarget {
     Address(SocketAddr),
     Domain(Target),
+    Unix(PathBuf),
 }
 
 impl RealityTarget {
@@ -251,12 +262,16 @@ impl RealityTarget {
             Self::Domain(target) => {
                 listener.ip().is_unspecified() && target.port == listener.port()
             }
+            Self::Unix(_) => false,
         }
     }
 }
 
 fn reality_target<'de, D: serde::Deserializer<'de>>(input: D) -> Result<RealityTarget, D::Error> {
     let value = String::deserialize(input)?;
+    if value.starts_with('/') && !value.as_bytes().contains(&0) {
+        return Ok(RealityTarget::Unix(PathBuf::from(value)));
+    }
     if let Ok(address) = value.parse::<SocketAddr>() {
         if address.port() != 0 {
             return Ok(RealityTarget::Address(address));
@@ -272,6 +287,47 @@ fn reality_target<'de, D: serde::Deserializer<'de>>(input: D) -> Result<RealityT
         }
     }
     Err(serde::de::Error::custom("invalid REALITY target address"))
+}
+
+#[cfg(test)]
+mod inbound_tls_settings_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_xray_server_name_with_single_certificate() {
+        let settings: InboundTlsSettings = serde_json::from_value(serde_json::json!({
+            "certificates": [{
+                "certificateFile": "/tmp/test.crt",
+                "keyFile": "/tmp/test.key"
+            }],
+            "serverName": "example.test",
+            "alpn": ["http/1.1"]
+        }))
+        .unwrap();
+        assert_eq!(settings.server_name, "example.test");
+        assert_eq!(settings.certificates.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod reality_target_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Holder(#[serde(deserialize_with = "reality_target")] RealityTarget);
+
+    #[test]
+    fn accepts_unix_socket_target() {
+        let Holder(target) = serde_json::from_str::<Holder>(r#""/dev/shm/nginx.sock""#).unwrap();
+        assert!(
+            matches!(target, RealityTarget::Unix(path) if path == PathBuf::from("/dev/shm/nginx.sock"))
+        );
+    }
+
+    #[test]
+    fn rejects_relative_socket_target() {
+        assert!(serde_json::from_str::<Holder>(r#""nginx.sock""#).is_err());
+    }
 }
 
 #[derive(Debug)]
@@ -418,6 +474,7 @@ fn from_legacy(config: LegacyConfig) -> Result<Config> {
             protocol: "freedom".into(),
             settings: serde_json::Value::Null,
             stream: serde_json::Value::Null,
+            send_through: None,
         }],
         Some(config.targets),
         None,
@@ -444,6 +501,7 @@ fn from_legacy(config: LegacyConfig) -> Result<Config> {
                 tls,
                 verifier,
                 fallback: None,
+                fallback_proxy_version: 0,
                 xhttp: None,
                 grpc: None,
             },
@@ -508,6 +566,7 @@ async fn from_profile(value: serde_json::Value) -> Result<Config> {
                         !matches!(
                             transport,
                             Transport::WebSocket(_)
+                                | Transport::WebSocketTls { .. }
                                 | Transport::Grpc(_)
                                 | Transport::Reality { xhttp: Some(_), .. }
                                 | Transport::Reality { grpc: Some(_), .. }
@@ -610,6 +669,23 @@ impl StreamSettings {
                 );
                 Ok(Transport::WebSocket(settings))
             }
+            ("ws", "tls") => {
+                ensure!(
+                    self.reality_settings.is_none()
+                        && self.grpc_settings.is_none()
+                        && self.xhttp_settings.is_none()
+                        && !self.sockopt.accept_proxy_protocol,
+                    "unexpected transport settings or PROXY protocol on TLS WebSocket inbound"
+                );
+                let settings = self.ws_settings.take().context("missing wsSettings")?;
+                ensure!(settings.path.starts_with('/'), "WebSocket path must start with '/'");
+                ensure!(
+                    !settings.accept_proxy_protocol,
+                    "PROXY protocol is unsupported on TLS WebSocket inbound"
+                );
+                let tls = self.tls_settings.take().context("missing tlsSettings")?.compile()?;
+                Ok(Transport::WebSocketTls { tls, settings })
+            }
             ("grpc", "" | "none") => {
                 ensure!(
                     address.ip().is_loopback()
@@ -665,8 +741,8 @@ impl StreamSettings {
                     .take()
                     .context("missing realitySettings")?;
                 ensure!(
-                    !reality.show && reality.xver == 0,
-                    "unsupported REALITY show or proxy protocol"
+                    !reality.show && reality.xver <= 2,
+                    "unsupported REALITY show or proxy protocol version"
                 );
                 ensure!(
                     !reality.target.points_to(address),
@@ -687,6 +763,7 @@ impl StreamSettings {
                     tls,
                     verifier,
                     fallback: Some(reality.target),
+                    fallback_proxy_version: reality.xver,
                     xhttp,
                     grpc,
                 })

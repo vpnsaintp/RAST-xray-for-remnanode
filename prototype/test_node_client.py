@@ -398,7 +398,7 @@ def check_shadowsocks():
         print("PASS Shadowsocks Go-client TCP, UDP, sniffing block, counters and dynamic users")
 
 
-def torrent_check(stack, stage, original, public, short_id, plugin):
+def torrent_check(stack, stage, tag, original, flow, public, short_id, plugin):
     class Echo(socketserver.BaseRequestHandler):
         def handle(self):
             self.request.sendall(read_exact(self.request, 68))
@@ -422,7 +422,7 @@ def torrent_check(stack, stage, original, public, short_id, plugin):
             return read_exact(client, len(payload))
 
     source = "127.0.0.2"
-    xray_client(stack, stage, original, "xtls-rprx-vision", public, short_id, 11081, source=source)
+    xray_client(stack, stage, original, flow, public, short_id, 11081, source=source)
     try:
         probe(11081)
     except (EOFError, OSError):
@@ -454,14 +454,14 @@ def torrent_check(stack, stage, original, public, short_id, plugin):
             address = f"127.0.0.{index}"
             account_id = str(20100 + index)
             account = str(uuid.uuid4())
-            result = api("handler/add-users", {"affectedInboundTags": [TAG], "users": [{
-                "inboundData": [{"type": "vless", "tag": TAG, "flow": "xtls-rprx-vision"}],
+            result = api("handler/add-users", {"affectedInboundTags": [tag], "users": [{
+                "inboundData": [{"type": "vless", "tag": tag, "flow": flow}],
                 "userData": {"userId": account_id, "hashUuid": account, "vlessUuid": account,
                              "trojanPassword": "", "ssPassword": ""},
             }]})
             assert result["success"], result
             port = 11088 + index
-            xray_client(stack, stage, account, "xtls-rprx-vision", public, short_id, port, source=address)
+            xray_client(stack, stage, account, flow, public, short_id, port, source=address)
             datagrams(port, 18486, blocked=True, payloads=payloads)
             wait_for_report(address, account_id)
             print(f"PASS Torrent Blocker rejected UDP {kind}")
@@ -602,9 +602,17 @@ def main():
             inbounds.append({"usersCount": 1, "tag": WS_TAG, "hash": "mux-test"})
         plugin = None
         if torrent:
-            profile["outbounds"][1]["settings"]["finalRules"][0]["port"] += ",18492"
-            profile["routing"]["rules"].append({
-                "type": "field", "network": "tcp", "port": 18492, "outboundTag": "DIRECT",
+            direct = next(item for item in profile["outbounds"] if item["protocol"] == "freedom")
+            direct.setdefault("settings", {}).setdefault("finalRules", []).insert(0, {
+                "action": "allow", "ip": ["127.0.0.1/32"], "port": "18492,18486"
+            })
+            profile["routing"]["rules"].insert(0, {
+                "type": "field", "network": "tcp", "port": 18492,
+                "outboundTag": direct["tag"],
+            })
+            profile["routing"]["rules"].insert(0, {
+                "type": "field", "network": "udp", "port": 18486,
+                "outboundTag": direct["tag"],
             })
             plugin = {"uuid": str(uuid.uuid4()), "name": "Torrent Blocker test", "config": {
                 "torrentBlocker": {"enabled": True, "blockDuration": 60,
@@ -647,7 +655,7 @@ def main():
         client_flow = inbound["settings"]["flow"] if shadow else "xtls-rprx-vision"
         xray_client(stack, stage, original, client_flow, public, short_id, 11080)
         if torrent:
-            torrent_check(stack, stage, original, public, short_id, plugin)
+            torrent_check(stack, stage, tag, original, client_flow, public, short_id, plugin)
             stop_core()
             return
         if shadow:
@@ -739,9 +747,11 @@ def main():
         assert all(user["downlink"] == user["uplink"] == 0 for user in reset), reset
         result = api("handler/remove-users", {"users": [{"userId": ADDED_ID, "hashUuid": added}]})
         assert result["success"], result
+        result = api("handler/remove-users", {"users": [{"userId": ADDED_ID, "hashUuid": added}]})
+        assert result["success"], result
         request_through(11081, "http://127.0.0.1:18480/", ok=False)
         request_through(11080, "http://127.0.0.1:18480/")
-        print("PASS dynamic user add/remove without restart, second Short ID, plain UDP and stats/reset")
+        print("PASS dynamic user add/idempotent remove without restart, second Short ID, plain UDP and stats/reset")
         if test_mux:
             check_mux_accounting(stack, mux_port)
         stop_core()

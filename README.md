@@ -42,8 +42,8 @@ git clone https://github.com/vpnsaintp/RAST-xray-for-remnanode.git
 cd RAST-xray-for-remnanode
 git clone https://github.com/ssrlive/reality-rs.git
 git -C reality-rs checkout --detach e71b6c20b0860d9fa9589862e81fa8869ed4fa7a
-git -C reality-rs apply --check ../prototype/reality-xray.patch
-git -C reality-rs apply ../prototype/reality-xray.patch
+git -C reality-rs apply --recount --ignore-space-change --ignore-whitespace --check ../prototype/reality-xray.patch
+git -C reality-rs apply --recount --ignore-space-change --ignore-whitespace ../prototype/reality-xray.patch
 docker run --rm --cpus 2 --memory 3g -e CARGO_BUILD_JOBS=2 \
   -v "$PWD:/src" -w /src/prototype rust:bookworm cargo build --locked --release
 ```

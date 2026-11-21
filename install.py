@@ -260,8 +260,9 @@ def build() -> Path:
     print('Получаю закреплённую зависимость и собираю ядро. Это может занять несколько минут.')
     run(['git', 'clone', 'https://github.com/ssrlive/reality-rs.git', str(dep)], timeout=180)
     run(['git', '-C', str(dep), 'checkout', '--detach', REALITY_COMMIT], timeout=60)
-    run(['git', '-C', str(dep), 'apply', '--check', '../prototype/reality-xray.patch'], timeout=30)
-    run(['git', '-C', str(dep), 'apply', '../prototype/reality-xray.patch'], timeout=30)
+    patch_flags = ['--recount', '--ignore-space-change', '--ignore-whitespace']
+    run(['git', '-C', str(dep), 'apply', *patch_flags, '--check', '../prototype/reality-xray.patch'], timeout=30)
+    run(['git', '-C', str(dep), 'apply', *patch_flags, '../prototype/reality-xray.patch'], timeout=30)
     run(['docker', 'run', '--rm', '--cpus', '2', '--memory', '3g', '-e', 'CARGO_BUILD_JOBS=2',
          '-v', f'{ROOT}:/src', '-w', '/src/prototype', 'rust:bookworm',
          'cargo', 'build', '--locked', '--release'], timeout=3600, capture=False)

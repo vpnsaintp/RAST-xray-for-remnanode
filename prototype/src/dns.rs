@@ -33,15 +33,21 @@ pub struct Config {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(untagged)]
 enum ServerConfig {
     Address(String),
-    WithDomains {
-        address: String,
-        port: Option<u16>,
-        #[serde(default)]
-        domains: Vec<String>,
-    },
+    WithDomains(ServerObject),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServerObject {
+    address: String,
+    port: Option<u16>,
+    #[serde(default)]
+    domains: Vec<String>,
+    #[serde(default)]
+    skip_fallback: bool,
 }
 
 #[derive(Default, Clone, Copy, Deserialize)]
@@ -56,8 +62,25 @@ enum ServerAddress {
     System,
     Udp(SocketAddr),
     Tls(TlsUpstream),
+    Https(HttpsUpstream),
 }
 
+struct HttpsUpstream {
+    tls: TlsUpstream,
+    uri: http::Uri,
+}
+
+impl HttpsUpstream {
+    fn parse(address: &str, port: Option<u16>) -> Result<Self> {
+        let uri: http::Uri = address.parse().context("invalid DoH URL")?;
+        ensure!(uri.scheme_str() == Some("https"), "DoH URL must use HTTPS");
+        let authority = uri.authority().context("DoH URL lacks authority")?;
+        ensure!(uri.path().starts_with('/'), "DoH URL lacks path");
+        ensure!(uri.query().is_none(), "DoH URL query is unsupported");
+        let tls = TlsUpstream::parse(authority.as_str(), port.or(Some(443)))?;
+        Ok(Self { tls, uri })
+    }
+}
 struct TlsUpstream {
     host: String,
     port: u16,
@@ -109,7 +132,6 @@ impl TlsUpstream {
         })
     }
 }
-
 fn system_tls_config() -> Result<Arc<ClientConfig>> {
     let bundle = if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
         std::fs::read(path).context("read configured system CA bundle")?
@@ -150,6 +172,7 @@ pub struct Resolver {
     pub tag: String,
     cache: Option<Mutex<HashMap<(String, bool), CachedAnswer>>>,
     tls: Option<Arc<ClientConfig>>,
+    doh_tls: Option<Arc<ClientConfig>>,
 }
 
 impl Resolver {
@@ -160,16 +183,22 @@ impl Resolver {
             .map(|server| {
                 let (address, port, domains) = match server {
                     ServerConfig::Address(address) => (address, None, Vec::new()),
-                    ServerConfig::WithDomains {
+                    ServerConfig::WithDomains(ServerObject {
                         address,
                         port,
                         domains,
-                    } => (address, port, domains),
+                        skip_fallback,
+                    }) => {
+                        ensure!(!skip_fallback, "DNS skipFallback=true is not supported");
+                        (address, port, domains)
+                    },
                 };
                 let address = if address == "localhost" {
                     ServerAddress::System
                 } else if let Some(authority) = address.strip_prefix("tls://") {
                     ServerAddress::Tls(TlsUpstream::parse(authority, port)?)
+                } else if address.starts_with("https://") {
+                    ServerAddress::Https(HttpsUpstream::parse(&address, port)?)
                 } else {
                     let ip = address
                         .parse()
@@ -190,12 +219,20 @@ impl Resolver {
             .any(|server| matches!(server.address, ServerAddress::Tls(_)))
             .then(system_tls_config)
             .transpose()?;
+        let doh_tls = if servers.iter().any(|server| matches!(server.address, ServerAddress::Https(_))) {
+            let mut config = (*system_tls_config()?).clone();
+            config.alpn_protocols = vec![b"h2".as_slice().into()];
+            Some(Arc::new(config))
+        } else {
+            None
+        };
         Ok(Self {
             servers,
             strategy: config.query_strategy,
             tag: config.tag,
             cache: (!config.disable_cache).then(Mutex::default),
             tls,
+            doh_tls,
         })
     }
 
@@ -260,6 +297,12 @@ impl Resolver {
                                 .as_ref()
                                 .context("DoT client configuration unavailable")?,
                         ),
+                        ServerAddress::Https(upstream) => QueryTransport::Https(
+                            upstream,
+                            self.doh_tls
+                                .as_ref()
+                                .context("DoH client configuration unavailable")?,
+                        ),
                         _ => continue,
                     };
                     resolve_records(transport, &query, v4, v6, &allow_tcp).await
@@ -301,6 +344,7 @@ impl Resolver {
 enum QueryTransport<'a> {
     Udp(SocketAddr),
     Tls(&'a TlsUpstream, &'a Arc<ClientConfig>),
+    Https(&'a HttpsUpstream, &'a Arc<ClientConfig>),
 }
 
 async fn resolve_records(
@@ -401,6 +445,45 @@ async fn exchange(
                 .context("DoT TLS handshake failed")?;
             checked_reply(&tcp_exchange(&mut stream, &bytes).await?, id, &query)?
         }
+        QueryTransport::Https(upstream, tls) => {
+            let addresses: Vec<_> = lookup_host((upstream.tls.host.as_str(), upstream.tls.port))
+                .await?
+                .filter(|address| allow_tcp(*address))
+                .collect();
+            ensure!(!addresses.is_empty(), "DoH upstream is blocked by routing");
+            let socket = TcpStream::connect(addresses.as_slice()).await?;
+            let stream = TlsStream::connect(
+                socket,
+                tls.clone(),
+                upstream.tls.server_name.clone(),
+            )
+            .await
+            .context("DoH TLS handshake failed")?;
+            let (mut sender, connection) = h2::client::handshake(stream).await?;
+            let driver = tokio::spawn(async move { connection.await });
+            let result = async {
+                let request = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri(upstream.uri.clone())
+                    .header(http::header::CONTENT_TYPE, "application/dns-message")
+                    .header(http::header::ACCEPT, "application/dns-message")
+                    .body(())?;
+                let (response, mut body) = sender.send_request(request, false)?;
+                body.send_data(bytes.clone().into(), true)?;
+                let response = response.await?;
+                ensure!(response.status().is_success(), "DoH upstream returned HTTP error");
+                let mut body = response.into_body();
+                let mut answer = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    answer.extend_from_slice(&chunk?);
+                    ensure!(answer.len() <= 65535, "DoH response too large");
+                }
+                checked_reply(&answer, id, &query)
+            }
+            .await;
+            driver.abort();
+            result?
+        }
     };
     ensure!(
         !reply.metadata.truncation && reply.metadata.response_code == ResponseCode::NoError,
@@ -463,6 +546,32 @@ fn checked_reply(bytes: &[u8], id: u16, query: &Query) -> Result<Message> {
 mod tests {
     use super::*;
     use hickory_proto::rr::{Record, rdata::A};
+
+    #[test]
+    fn parses_remnawave_doh_object_server() -> Result<()> {
+        let config: Config = serde_json::from_str(
+            r#"{"servers":[{"address":"https://dns.google/dns-query","skipFallback":false}],"queryStrategy":"UseIPv4"}"#,
+        )?;
+        assert_eq!(config.servers.len(), 1);
+        let ServerConfig::WithDomains(server) = &config.servers[0] else {
+            bail!("expected object DNS server");
+        };
+        assert_eq!(server.address, "https://dns.google/dns-query");
+        assert!(!server.skip_fallback);
+        assert!(matches!(config.query_strategy, Strategy::UseIPv4));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_doh_url_without_downgrade() -> Result<()> {
+        let upstream = HttpsUpstream::parse("https://dns.google/dns-query", None)?;
+        assert_eq!(upstream.tls.host, "dns.google");
+        assert_eq!(upstream.tls.port, 443);
+        assert_eq!(upstream.uri.path(), "/dns-query");
+        assert!(HttpsUpstream::parse("http://dns.google/dns-query", None).is_err());
+        assert!(HttpsUpstream::parse("https://dns.google/dns-query?secret=1", None).is_err());
+        Ok(())
+    }
     use std::net::Ipv4Addr;
 
     #[test]
@@ -501,11 +610,12 @@ mod tests {
         let fallback = UdpSocket::bind("127.0.0.1:0").await?;
         let matched = UdpSocket::bind("127.0.0.1:0").await?;
         let upstream = |socket: &UdpSocket, domains| -> Result<ServerConfig> {
-            Ok(ServerConfig::WithDomains {
+            Ok(ServerConfig::WithDomains(ServerObject {
                 address: "127.0.0.1".into(),
                 port: Some(socket.local_addr()?.port()),
                 domains,
-            })
+                skip_fallback: false,
+            }))
         };
         let resolver = Resolver::compile(
             Config {

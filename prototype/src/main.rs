@@ -6,6 +6,7 @@ mod egress;
 mod geodata;
 mod go_router;
 mod grpc;
+mod half_close;
 mod mux;
 mod proxy_protocol;
 mod routing;
@@ -35,6 +36,7 @@ use subtle::ConstantTimeEq;
 use tls_stream::{SpliceReader, TlsStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::UnixStream;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -47,22 +49,35 @@ const LISTEN_BACKLOG: i32 = 65_535;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let first = args.next().context("supply a config file")?;
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    let first = args.first().context("supply a config file")?;
     if first == "version" || first == "--version" {
         println!("NightVPN Rust Core {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let path = if first == "-config" {
-        args.next().context("missing config path")?
+    let test_only = if args.first().is_some_and(|arg| arg == "-test") {
+        args.remove(0);
+        true
     } else {
-        first
+        false
     };
-    match (args.next().as_deref(), args.next().as_deref(), args.next()) {
-        (None, None, None) | (Some("-format"), Some("json"), None) => {}
-        _ => bail!("unsupported CLI arguments"),
-    }
+    let path = if args.first().is_some_and(|arg| arg == "-config" || arg == "-c") {
+        args.remove(0);
+        ensure!(!args.is_empty(), "missing config path");
+        args.remove(0)
+    } else {
+        ensure!(!args.is_empty(), "supply a config file");
+        args.remove(0)
+    };
+    ensure!(
+        args.is_empty() || args.as_slice() == ["-format", "json"],
+        "unsupported CLI arguments"
+    );
     let mut config = config::load(&path).await?;
+    if test_only {
+        println!("Configuration OK");
+        return Ok(());
+    }
     config.state.stats.start_clock();
     let mut services = JoinSet::new();
     for inbound in config.inbounds {
@@ -168,7 +183,6 @@ async fn serve(
         });
     }
 }
-
 async fn accept_tcp(listener: &TcpListener) -> std::io::Result<(TcpStream, SocketAddr)> {
     loop {
         match listener.accept().await {
@@ -185,7 +199,6 @@ async fn accept_tcp(listener: &TcpListener) -> std::io::Result<(TcpStream, Socke
         }
     }
 }
-
 fn canonical_address(address: SocketAddr) -> SocketAddr {
     if let SocketAddr::V6(ipv6) = address {
         if let Some(ipv4) = ipv6.ip().to_ipv4_mapped() {
@@ -235,6 +248,7 @@ async fn session(
             tls,
             verifier,
             fallback,
+            fallback_proxy_version,
             xhttp,
             grpc,
         } => {
@@ -246,16 +260,31 @@ async fn session(
                 )
                 .await??;
                 if !is_reality {
-                    let mut site = timeout(
+                    let site = timeout(
                         CONNECT_TIMEOUT,
                         connect_reality_target(destination, local_listener),
                     )
                     .await??;
-                    timeout(CONNECT_TIMEOUT, site.write_all(&preface)).await??;
-                    if splice::enabled() {
-                        splice::copy_tcp(&mut socket, &mut site).await?;
+                    let header = if *fallback_proxy_version != 0 {
+                        proxy_protocol::encode(*fallback_proxy_version, peer, listener)?
                     } else {
-                        tokio::io::copy_bidirectional(&mut socket, &mut site).await?;
+                        Vec::new()
+                    };
+                    match site {
+                        RealityConnection::Tcp(mut site) => {
+                            timeout(CONNECT_TIMEOUT, site.write_all(&header)).await??;
+                            timeout(CONNECT_TIMEOUT, site.write_all(&preface)).await??;
+                            if splice::enabled() {
+                                splice::copy_tcp(&mut socket, &mut site).await?;
+                            } else {
+                                tokio::io::copy_bidirectional(&mut socket, &mut site).await?;
+                            }
+                        }
+                        RealityConnection::Unix(mut site) => {
+                            timeout(CONNECT_TIMEOUT, site.write_all(&header)).await??;
+                            timeout(CONNECT_TIMEOUT, site.write_all(&preface)).await??;
+                            tokio::io::copy_bidirectional(&mut socket, &mut site).await?;
+                        }
                     }
                     return Ok(());
                 }
@@ -338,6 +367,33 @@ async fn session(
             )
             .await
         }
+        Transport::WebSocketTls { tls, settings } => {
+            let stream = timeout(
+                CONNECT_TIMEOUT,
+                TlsStream::accept(socket, tls.clone(), Vec::new()),
+            )
+            .await??;
+            let (stream, forwarded_ip) = timeout(
+                CONNECT_TIMEOUT,
+                ws::accept(
+                    stream,
+                    settings,
+                    &inbound.socket_options.trusted_x_forwarded_for,
+                ),
+            )
+            .await??;
+            let peer = forwarded_ip.map_or(peer, |ip| SocketAddr::new(ip, 0));
+            vless_session(
+                stream,
+                canonical_address(peer),
+                canonical_address(listener),
+                inbound,
+                backend,
+                traffic,
+                None,
+            )
+            .await
+        }
         Transport::Tls(tls) => {
             let stream = timeout(
                 CONNECT_TIMEOUT,
@@ -359,9 +415,14 @@ async fn session(
     }
 }
 
-async fn connect_reality_target(target: &RealityTarget, listener: SocketAddr) -> Result<TcpStream> {
+enum RealityConnection {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+async fn connect_reality_target(target: &RealityTarget, listener: SocketAddr) -> Result<RealityConnection> {
     match target {
-        RealityTarget::Address(address) => Ok(TcpStream::connect(address).await?),
+        RealityTarget::Address(address) => Ok(RealityConnection::Tcp(TcpStream::connect(address).await?)),
         RealityTarget::Domain(target) => {
             let mut addresses = target.addresses().await?;
             addresses.retain(|address| canonical_address(*address) != listener);
@@ -369,8 +430,26 @@ async fn connect_reality_target(target: &RealityTarget, listener: SocketAddr) ->
                 !addresses.is_empty(),
                 "REALITY fallback has no usable address"
             );
-            Ok(TcpStream::connect(addresses.as_slice()).await?)
+            Ok(RealityConnection::Tcp(TcpStream::connect(addresses.as_slice()).await?))
         }
+        RealityTarget::Unix(path) => Ok(RealityConnection::Unix(UnixStream::connect(path).await?)),
+    }
+}
+
+#[cfg(test)]
+mod reality_unix_target_tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn connects_to_unix_fallback() {
+        let path = std::env::temp_dir().join(format!("nightvpn-reality-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let target = RealityTarget::Unix(path.clone());
+        let result = connect_reality_target(&target, "127.0.0.1:18443".parse().unwrap()).await;
+        assert!(matches!(result, Ok(RealityConnection::Unix(_))));
+        listener.accept().await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }
 
@@ -452,8 +531,7 @@ async fn vless_session(
             if vision {
                 relay_vision_tcp(stream, &mut origin, id, direct.as_deref(), raw_reader).await
             } else {
-                tokio::io::copy_bidirectional(&mut stream, &mut origin).await?;
-                Ok(())
+                relay_plain_tcp(stream, origin).await
             }
         } else if command == 2 {
             reply(&mut stream).await?;
@@ -636,15 +714,39 @@ async fn relay_raw_uplink(
     mut read: TcpStream,
     write: &mut (impl AsyncWrite + Unpin),
     target: Option<(TcpStream, Meter)>,
+    progress: &half_close::Progress,
 ) -> Result<()> {
     if let Some((socket, meter)) = target {
-        match splice::copy(&read, &socket, |size| meter.add(size, true)).await? {
+        match splice::copy(&read, &socket, |size| {
+            meter.add(size, true);
+            progress.add(size);
+        }).await? {
             splice::Transfer::Complete => return Ok(()),
             splice::Transfer::Buffered(tail) => write.write_all(&tail).await?,
         }
     }
+    let mut read = progress.reader(read);
     tokio::io::copy(&mut read, write).await?;
     Ok(())
+}
+
+async fn relay_plain_tcp(stream: impl Tunnel, origin: Metered<Box<dyn Tunnel>>) -> Result<()> {
+    let progress = half_close::Progress::default();
+    let (read, mut write) = tokio::io::split(stream);
+    let (source, mut destination) = tokio::io::split(origin);
+    let mut read = progress.reader(read);
+    let mut source = progress.reader(source);
+    let uplink = async {
+        tokio::io::copy(&mut read, &mut destination).await?;
+        destination.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let downlink = async {
+        tokio::io::copy(&mut source, &mut write).await?;
+        write.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    half_close::join(uplink, downlink, progress).await
 }
 
 async fn relay_vision_tcp(
@@ -654,16 +756,20 @@ async fn relay_vision_tcp(
     direct: Option<&AtomicBool>,
     raw_reader: Option<SpliceReader>,
 ) -> Result<()> {
+    let progress = half_close::Progress::default();
     let raw_target = raw_reader.as_ref().and_then(|_| splice_target(origin));
     let (mut read, mut write) = tokio::io::split(stream);
     let (mut source, mut destination) = tokio::io::split(origin);
+    let mut read = progress.reader(read);
+    let mut source = progress.reader(source);
+    let uplink_progress = progress.clone();
     let uplink = async {
         let raw = read_vision_prefix(&mut read, &mut destination, id, direct).await?;
         if let Some(socket) = raw_reader
             .filter(|_| raw)
             .and_then(SpliceReader::into_socket)
         {
-            relay_raw_uplink(socket, &mut destination, raw_target).await?;
+            relay_raw_uplink(socket, &mut destination, raw_target, &uplink_progress).await?;
         } else {
             tokio::io::copy(&mut read, &mut destination).await?;
         }
@@ -680,8 +786,7 @@ async fn relay_vision_tcp(
         write.shutdown().await?;
         Ok::<_, anyhow::Error>(())
     };
-    tokio::try_join!(uplink, downlink)?;
-    Ok(())
+    half_close::join(uplink, downlink, progress).await
 }
 
 async fn relay_sniffed_tcp(
@@ -706,14 +811,18 @@ async fn relay_sniffed_tcp(
         vision: bool,
         raw_input: Option<oneshot::Receiver<TcpStream>>,
     ) -> Result<()> {
-        let origin = open_sniffed_tcp(read, backend, target, sniffing, flow, traffic).await?;
+        let progress = half_close::Progress::default();
+        let mut read = progress.reader(read);
+        let origin = open_sniffed_tcp(&mut read, backend, target, sniffing, flow, traffic).await?;
         let raw_target = raw_input.as_ref().and_then(|_| splice_target(&origin));
         let (mut source, mut destination) = tokio::io::split(origin);
+        let mut source = progress.reader(source);
+        let uplink_progress = progress.clone();
         let up = async {
-            tokio::io::copy(read, &mut destination).await?;
+            tokio::io::copy(&mut read, &mut destination).await?;
             if let Some(raw_input) = raw_input {
                 if let Ok(socket) = raw_input.await {
-                    relay_raw_uplink(socket, &mut destination, raw_target).await?;
+                    relay_raw_uplink(socket, &mut destination, raw_target, &uplink_progress).await?;
                 }
             }
             destination.shutdown().await?;
@@ -731,8 +840,7 @@ async fn relay_sniffed_tcp(
             write.shutdown().await?;
             Ok::<_, anyhow::Error>(())
         };
-        tokio::try_join!(up, down)?;
-        Ok(())
+        half_close::join(up, down, progress).await
     }
     if let Some(direct) = direct {
         let (mut decoded, mut writer) = tokio::io::duplex(8192);

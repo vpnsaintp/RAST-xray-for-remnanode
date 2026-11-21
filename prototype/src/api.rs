@@ -82,10 +82,11 @@ impl Api {
                 let id = users
                     .values()
                     .find(|client| client.user.email == email)
-                    .map(|client| client.id())
-                    .ok_or_else(|| Status::not_found("user missing"))?;
-                if let Some(client) = users.remove(&id) {
-                    client.user.cancel();
+                    .map(|client| client.id());
+                if let Some(id) = id {
+                    if let Some(client) = users.remove(&id) {
+                        client.user.cancel();
+                    }
                 }
                 self.state.stats.remove_online(&email);
             }
@@ -119,7 +120,6 @@ impl Api {
             .ok_or_else(|| Status::not_found("unknown inbound"))
     }
 }
-
 pub async fn serve(name: String, state: Arc<State>, backend: Arc<Backend>) -> Result<()> {
     let name = name
         .strip_prefix('@')
@@ -262,11 +262,12 @@ impl HandlerService for Api {
                     .read()
                     .unwrap()
                     .iter()
-                    .find_map(|(id, user)| (user.email == email).then_some(*id))
-                    .ok_or_else(|| Status::not_found("user missing"))?;
-                self.forward(&request.tag, &op.r#type, op.value).await?;
-                if let Some(user) = users.write().unwrap().remove(&id) {
-                    user.cancel();
+                    .find_map(|(id, user)| (user.email == email).then_some(*id));
+                if let Some(id) = id {
+                    self.forward(&request.tag, &op.r#type, op.value).await?;
+                    if let Some(user) = users.write().unwrap().remove(&id) {
+                        user.cancel();
+                    }
                 }
                 self.state.stats.remove_online(&email);
             }
@@ -337,7 +338,6 @@ impl HandlerService for Api {
         Ok(Response::new(GetInboundUsersCountResponse { count }))
     }
 }
-
 fn decode<T: Message + Default>(bytes: &[u8]) -> Result<T, Status> {
     T::decode(bytes).map_err(|_| Status::invalid_argument("invalid protobuf operation"))
 }

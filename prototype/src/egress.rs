@@ -20,7 +20,7 @@ use rustls::{ClientConfig, ClientSide};
 use serde::Deserialize;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use uuid::Uuid;
 
 use crate::backend::Tunnel;
@@ -37,6 +37,8 @@ pub struct Outbound {
     pub settings: serde_json::Value,
     #[serde(rename = "streamSettings", default)]
     pub stream: serde_json::Value,
+    #[serde(rename = "sendThrough", default)]
+    pub send_through: Option<IpAddr>,
 }
 
 #[derive(Clone)]
@@ -59,8 +61,12 @@ impl Egress {
             matches!(outbound.protocol.as_str(), "vless" | "freedom") || empty(&stream),
             "unsupported outbound stream settings"
         );
+        ensure!(
+            outbound.send_through.is_none() || outbound.protocol == "freedom",
+            "sendThrough is supported only for freedom outbound"
+        );
         Ok(match outbound.protocol.as_str() {
-            "freedom" => Self::Direct(Direct::compile(settings, stream)?),
+            "freedom" => Self::Direct(Direct::compile(settings, stream, outbound.send_through)?),
             "blackhole" if empty(&settings) => Self::Block,
             "http" => {
                 let proxy: HttpSettings = serde_json::from_value(settings)?;
@@ -79,7 +85,6 @@ impl Egress {
         })
     }
 }
-
 fn only<T>(mut items: Vec<T>, description: &str) -> Result<T> {
     ensure!(items.len() == 1, "expected one {description}");
     Ok(items.pop().unwrap())
@@ -94,6 +99,8 @@ pub struct Direct {
     pub final_rules: Vec<FinalRule>,
     #[serde(skip)]
     sockopt: OutboundSockopt,
+    #[serde(skip)]
+    send_through: Option<IpAddr>,
 }
 
 #[derive(Default, Deserialize)]
@@ -116,7 +123,11 @@ pub struct FinalRule {
 }
 
 impl Direct {
-    fn compile(settings: serde_json::Value, stream: serde_json::Value) -> Result<Self> {
+    fn compile(
+        settings: serde_json::Value,
+        stream: serde_json::Value,
+        send_through: Option<IpAddr>,
+    ) -> Result<Self> {
         let mut direct: Self = if settings.is_null() {
             Self::default()
         } else {
@@ -133,11 +144,16 @@ impl Direct {
             "unsupported freedom transport"
         );
         ensure!(
-            matches!(direct.target_strategy.as_str(), "" | "AsIs" | "ForceIPv4"),
+            matches!(direct.target_strategy.as_str(), "" | "AsIs" | "ForceIPv4" | "UseIPv4"),
             "unsupported freedom strategy"
         );
         stream.sockopt.validate()?;
         direct.sockopt = stream.sockopt;
+        ensure!(
+            send_through.is_none_or(|ip| !ip.is_unspecified()),
+            "sendThrough must name a specific source IP"
+        );
+        direct.send_through = send_through;
         Ok(direct)
     }
 
@@ -147,7 +163,7 @@ impl Direct {
         target: &Target,
         legacy_fixture: bool,
     ) -> Result<Vec<SocketAddr>> {
-        let force_v4 = self.target_strategy == "ForceIPv4" || self.sockopt.force_ipv4();
+        let force_v4 = matches!(self.target_strategy.as_str(), "ForceIPv4" | "UseIPv4") || self.sockopt.force_ipv4();
         let mut addresses = router.resolve(target, force_v4, force_v4).await?;
         addresses.retain(|address| {
             let matched = self.final_rules.iter().find(|rule| {
@@ -173,12 +189,54 @@ impl Direct {
     }
 
     pub async fn connect(&self, addresses: &[SocketAddr]) -> Result<TcpStream> {
-        let socket = TcpStream::connect(addresses).await?;
+        let socket = if let Some(source) = self.send_through {
+            let mut last_error = None;
+            let mut connected = None;
+            for address in addresses
+                .iter()
+                .copied()
+                .filter(|addr| addr.is_ipv4() == source.is_ipv4())
+            {
+                let tcp = if source.is_ipv4() {
+                    TcpSocket::new_v4()?
+                } else {
+                    TcpSocket::new_v6()?
+                };
+                tcp.bind(SocketAddr::new(source, 0))?;
+                match tcp.connect(address).await {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            connected.ok_or_else(|| {
+                last_error.map(anyhow::Error::from).unwrap_or_else(|| {
+                    anyhow::anyhow!("no destination matching sendThrough address family")
+                })
+            })?
+        } else {
+            TcpStream::connect(addresses).await?
+        };
         self.sockopt.apply_tcp(&socket)?;
         Ok(socket)
     }
-}
 
+    pub async fn udp_socket(&self, address: SocketAddr) -> Result<UdpSocket> {
+        let source = match self.send_through {
+            Some(source) if source.is_ipv4() != address.is_ipv4() => {
+                bail!("UDP destination does not match sendThrough address family")
+            }
+            Some(source) => source,
+            None if address.is_ipv4() => std::net::Ipv4Addr::UNSPECIFIED.into(),
+            None => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        };
+        let socket = UdpSocket::bind(SocketAddr::new(source, 0)).await?;
+        socket.connect(address).await?;
+        Ok(socket)
+    }
+}
 fn private_address(address: IpAddr) -> bool {
     // Xray's default Freedom policy for VLESS inbounds.
     static PRIVATE: LazyLock<Vec<ipnet::IpNet>> = LazyLock::new(|| {
@@ -618,5 +676,129 @@ impl ServerVerifier for Pins {
         for pin in &self.pins {
             hasher.write(pin);
         }
+    }
+}
+
+#[cfg(test)]
+mod send_through_tests {
+    use super::*;
+    use tokio::net::{TcpListener, UdpSocket};
+
+    fn direct(source: &str) -> Direct {
+        Direct::compile(
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            Some(source.parse().unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_remnawave_freedom_use_ipv4() {
+        let outbound: Outbound = serde_json::from_str(
+            r#"{"tag":"DIRECT","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"}}"#,
+        )
+        .unwrap();
+        let Egress::Direct(direct) = Egress::compile(outbound).unwrap() else {
+            panic!("expected freedom outbound");
+        };
+        assert_eq!(direct.target_strategy, "UseIPv4");
+    }
+
+    #[tokio::test]
+    async fn tcp_uses_requested_source_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = direct("127.0.0.2").connect(&[address]).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!(
+            client.local_addr().unwrap().ip(),
+            "127.0.0.2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(peer.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn tcp_never_falls_back_when_source_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(direct("192.0.2.254").connect(&[address]).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_uses_requested_source_address() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = direct("127.0.0.2")
+            .udp_socket(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        client.send(b"test").await.unwrap();
+        let mut bytes = [0; 4];
+        let (_, peer) = listener.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(peer.ip(), "127.0.0.2".parse::<IpAddr>().unwrap());
+        assert_eq!(&bytes, b"test");
+    }
+
+    #[tokio::test]
+    async fn udp_never_falls_back_when_source_is_unavailable() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(
+            direct("192.0.2.254")
+                .udp_socket(listener.local_addr().unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_never_falls_back_to_other_address_family() {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        assert!(
+            direct("127.0.0.2")
+                .connect(&[listener.local_addr().unwrap()])
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_send_through_from_xray_outbound() {
+        let outbound: Outbound = serde_json::from_str(
+            r#"{"tag":"DIRECT","protocol":"freedom","sendThrough":"127.0.0.2"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            Egress::compile(outbound).unwrap(),
+            Egress::Direct(Direct {
+                send_through: Some(IpAddr::V4(_)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_send_through_on_unimplemented_outbound() {
+        let outbound: Outbound = serde_json::from_str(
+            r#"{"tag":"PROXY","protocol":"http","sendThrough":"127.0.0.2","settings":{"servers":[{"address":"127.0.0.1","port":8080}]}}"#,
+        )
+        .unwrap();
+        assert!(Egress::compile(outbound).is_err());
+    }
+
+    #[test]
+    fn rejects_unspecified_source_instead_of_falling_back() {
+        assert!(
+            Direct::compile(
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                Some("0.0.0.0".parse().unwrap())
+            )
+            .is_err()
+        );
     }
 }

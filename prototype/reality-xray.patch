@@ -1,5 +1,5 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 80a3871..3d282b9 100644
+index 80a3871a..3d282b98 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -106,7 +106,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features =
@@ -12,10 +12,43 @@ index 80a3871..3d282b9 100644
  ], default-features = false }
  webpki-roots = "1.0.9"
 diff --git a/rustls-aws-lc-rs/src/reality.rs b/rustls-aws-lc-rs/src/reality.rs
-index 3a1f0f9..77dec6e 100644
+index 3a1f0f92..99978fe6 100644
 --- a/rustls-aws-lc-rs/src/reality.rs
 +++ b/rustls-aws-lc-rs/src/reality.rs
-@@ -94,8 +94,9 @@ impl ServerCredentialResolver for RealityServerCredentialResolver {
+@@ -18,7 +18,7 @@ use rustls::client::danger::{
+     HandshakeSignatureValid, RealitySessionIdGenerator, RealitySessionIdSealer,
+     SealingRealitySessionIdGenerator, ServerIdentity, ServerVerifier, VerifiedIdentity,
+ };
+-use rustls::client::{ParsedCertificate, verify_server_name};
++use rustls::client::{ClientHelloProfile, ParsedCertificate, verify_server_name};
+ use rustls::crypto::Identity;
+ use rustls::crypto::tls13::{Hkdf, HkdfUsingHmac};
+ use rustls::crypto::{
+@@ -26,7 +26,7 @@ use rustls::crypto::{
+     kx::{NamedGroup, SupportedKxGroup},
+ };
+ use rustls::crypto::{SelectedCredential, SignatureScheme};
+-use rustls::error::{ApiMisuse, Error};
++use rustls::error::{ApiMisuse, CertificateError, Error};
+ use rustls::server::{
+     ClientHello, ClientHelloVerifier, RealityClientHello, RealityClientHelloProbe, ServerConfig,
+     ServerCredentialResolver,
+@@ -36,6 +36,14 @@ use rustls::{ClientConfig, RootCertStore};
+ use subtle::ConstantTimeEq;
+
+ static REALITY_X25519_KX_GROUPS: &[&dyn SupportedKxGroup] = &[crate::kx_group::X25519];
++static REALITY_CLIENT_KX_GROUPS: &[&dyn SupportedKxGroup] =
++    &[crate::kx_group::X25519MLKEM768, crate::kx_group::X25519];
++static BROWSER_REALITY_CLIENT_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
++    crate::kx_group::X25519MLKEM768,
++    crate::kx_group::X25519,
++    crate::kx_group::SECP256R1,
++    crate::kx_group::SECP384R1,
++];
+ const REALITY_X25519_PUBLIC_KEY_LEN: usize = 32;
+ const REALITY_X25519_PRIVATE_KEY_LEN: usize = 32;
+ const DEFAULT_REALITY_MAX_TIME_SKEW: Duration = Duration::from_secs(30);
+@@ -94,8 +102,9 @@ impl ServerCredentialResolver for RealityServerCredentialResolver {
              .provider
              .key_provider
              .load_private_key(private_key)?;
@@ -26,7 +59,27 @@ index 3a1f0f9..77dec6e 100644
              .ok_or(Error::NoSuitableCertificate)?;
          Ok(SelectedCredential::new(identity, signer))
      }
-@@ -354,6 +355,7 @@ pub struct RealitySessionIdConfig {
+@@ -129,7 +138,18 @@ impl ServerVerifier for RealityServerVerifier {
+             ));
+         }
+         let parsed = ParsedCertificate::try_from(&certificates.end_entity)?;
+-        verify_server_name(&parsed, identity.server_name)?;
++        // Go REALITY's temporary certificate has no SAN. The pinned X25519 key
++        // authenticates the SNI-bearing ClientHello and the certificate's
++        // Ed25519 key. Retain the name check for peers that provide DNS/IP SANs.
++        if let Err(error) = verify_server_name(&parsed, identity.server_name) {
++            match error {
++                Error::InvalidCertificate(CertificateError::NotValidForNameContext {
++                    presented,
++                    ..
++                }) if presented.is_empty() => {}
++                error => return Err(error),
++            }
++        }
+         Ok(VerifiedIdentity::assertion(identity.identity.clone()))
+     }
+
+@@ -354,6 +374,7 @@ pub struct RealitySessionIdConfig {
  #[derive(Debug, Clone)]
  pub struct RealityServerVerifierConfig {
      version: [u8; 3],
@@ -34,7 +87,7 @@ index 3a1f0f9..77dec6e 100644
      short_ids: Vec<Vec<u8>>,
      server_private_key: Vec<u8>,
      time_provider: Arc<dyn TimeProvider>,
-@@ -363,6 +365,7 @@ pub struct RealityServerVerifierConfig {
+@@ -363,6 +384,7 @@ pub struct RealityServerVerifierConfig {
  /// aws-lc-rs backed REALITY verifier for incoming TLS 1.3 client hellos.
  pub struct AwsLcRsRealityClientHelloVerifier {
      version: [u8; 3],
@@ -42,7 +95,54 @@ index 3a1f0f9..77dec6e 100644
      short_ids: Vec<[u8; 8]>,
      short_id_lens: Vec<usize>,
      server_private_key: Vec<u8>,
-@@ -532,6 +535,7 @@ impl RealityServerVerifierConfig {
+@@ -500,7 +522,45 @@ impl RealitySessionIdConfig {
+         &self,
+         root_store: impl Into<Arc<RootCertStore>>,
+     ) -> Result<ClientConfig, Error> {
+-        let provider = Arc::new(default_x25519_tls13_reality_provider());
++        self.build_client_config_with_provider(default_x25519_tls13_reality_provider(), root_store)
++    }
++
++    /// Builds a REALITY client that sends the hybrid key share expected by current Go Xray.
++    pub fn build_hybrid_client_config(
++        &self,
++        root_store: impl Into<Arc<RootCertStore>>,
++    ) -> Result<ClientConfig, Error> {
++        let mut provider = crate::DEFAULT_TLS13_PROVIDER.clone();
++        provider.kx_groups = Cow::Borrowed(REALITY_CLIENT_KX_GROUPS);
++        self.build_client_config_with_provider(provider, root_store)
++    }
++
++    /// Builds an outbound REALITY client with the selected browser-derived ClientHello.
++    pub fn build_browser_client_config(
++        &self,
++        profile: ClientHelloProfile,
++        root_store: impl Into<Arc<RootCertStore>>,
++    ) -> Result<ClientConfig, Error> {
++        let mut provider = crate::DEFAULT_TLS13_PROVIDER.clone();
++        provider.kx_groups = Cow::Borrowed(match profile {
++            // Go REALITY requires the hybrid share before the optional X25519 share,
++            // including when the original browser profile only offers X25519.
++            ClientHelloProfile::Firefox148 | ClientHelloProfile::Edge => {
++                BROWSER_REALITY_CLIENT_KX_GROUPS
++            }
++            _ => REALITY_CLIENT_KX_GROUPS,
++        });
++        let mut config = self.build_client_config_with_provider(provider, root_store)?;
++        config.client_hello_profile = profile;
++        Ok(config)
++    }
++
++    fn build_client_config_with_provider(
++        &self,
++        provider: CryptoProvider,
++        root_store: impl Into<Arc<RootCertStore>>,
++    ) -> Result<ClientConfig, Error> {
++        let provider = Arc::new(provider);
+         let root_store = root_store.into();
+         let fallback = rustls::client::WebPkiServerVerifier::new_without_revocation(
+             root_store.clone(),
+@@ -532,6 +592,7 @@ impl RealityServerVerifierConfig {
      pub fn new(version: [u8; 3], short_id: impl AsRef<[u8]>, server_private_key: Vec<u8>) -> Self {
          Self {
              version,
@@ -50,10 +150,10 @@ index 3a1f0f9..77dec6e 100644
              short_ids: vec![short_id.as_ref().to_vec()],
              server_private_key,
              time_provider: Arc::new(DefaultTimeProvider),
-@@ -576,6 +580,13 @@ impl RealityServerVerifierConfig {
+@@ -576,6 +637,13 @@ impl RealityServerVerifierConfig {
          self
      }
- 
+
 +    /// Sets the inclusive bounds of the authenticated Xray client version.
 +    pub fn with_client_version_range(mut self, minimum: [u8; 3], maximum: [u8; 3]) -> Self {
 +        self.version = minimum;
@@ -64,7 +164,7 @@ index 3a1f0f9..77dec6e 100644
      /// Replaces the accepted Short ID with the configured Xray `shortIds` list.
      pub fn with_short_ids<I, S>(mut self, short_ids: I) -> Self
      where
-@@ -632,6 +643,7 @@ impl RealityServerVerifierConfig {
+@@ -632,6 +700,7 @@ impl RealityServerVerifierConfig {
          }
          Ok(AwsLcRsRealityClientHelloVerifier {
              version: self.version,
@@ -72,10 +172,10 @@ index 3a1f0f9..77dec6e 100644
              short_ids: fixed_short_ids,
              short_id_lens,
              server_private_key: self.server_private_key.clone(),
-@@ -751,11 +763,7 @@ impl AwsLcRsRealityClientHelloVerifier {
+@@ -751,11 +820,7 @@ impl AwsLcRsRealityClientHelloVerifier {
              ));
          }
- 
+
 -        if plaintext[..3]
 -            .ct_eq(&self.version)
 -            .unwrap_u8()
@@ -85,7 +185,7 @@ index 3a1f0f9..77dec6e 100644
              return Err(Error::General(
                  "REALITY server verifier rejected an unexpected version tag".into(),
              ));
-@@ -787,7 +795,9 @@ impl AwsLcRsRealityClientHelloVerifier {
+@@ -787,7 +852,9 @@ impl AwsLcRsRealityClientHelloVerifier {
              .current_time()
              .ok_or(Error::FailedToGetCurrentTime)?
              .as_secs();
@@ -96,16 +196,909 @@ index 3a1f0f9..77dec6e 100644
              return Err(Error::General(
                  "REALITY server verifier rejected a stale timestamp".into(),
              ));
-@@ -829,6 +839,7 @@ impl ClientHelloVerifier for AwsLcRsRealityClientHelloVerifier {
- 
+@@ -829,6 +896,7 @@ impl ClientHelloVerifier for AwsLcRsRealityClientHelloVerifier {
+
      fn hash_config(&self, h: &mut dyn Hasher) {
          h.write(&self.version);
 +        h.write(&self.max_client_version);
          h.write_usize(self.short_ids.len());
          for (short_id, short_id_len) in self
              .short_ids
+@@ -1053,7 +1121,6 @@ mod tests {
+     use core::time::Duration;
+     use pki_types::pem::PemObject;
+     use pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+-    use rustls::client::ClientHelloProfile;
+     use rustls::client::danger::{
+         HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
+         VerifiedIdentity,
+@@ -1285,6 +1352,88 @@ mod tests {
+             .collect()
+     }
+
++    #[test]
++    fn outbound_browser_profiles_emit_distinct_reality_client_hellos() {
++        let private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
++        let public_key = private_key
++            .compute_public_key()
++            .unwrap();
++        let short_id = [1, 2, 3, 4, 5, 6, 7, 8];
++        for (profile, ciphers, groups, shares, extensions) in [
++            (
++                ClientHelloProfile::Firefox148,
++                &[0x1301, 0x1303, 0x1302][..],
++                &[0x11ec, 0x001d, 0x0017, 0x0018][..],
++                &[0x11ec, 0x001d, 0x0017][..],
++                &[
++                    0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0010, 0x0005, 0x0012, 0x0033, 0x002b,
++                    0x000d, 0x001c, 0xfe0d,
++                ][..],
++            ),
++            (
++                ClientHelloProfile::Edge,
++                &[0xffff, 0x1301, 0x1302, 0x1303][..],
++                &[0xffff, 0x11ec, 0x001d, 0x0017, 0x0018][..],
++                &[0xffff, 0x11ec, 0x001d][..],
++                &[
++                    0xffff, 0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x0010, 0x0005, 0x000d,
++                    0x0012, 0x0033, 0x002d, 0x002b, 0xffff,
++                ][..],
++            ),
++        ] {
++            let mut config =
++                RealitySessionIdConfig::new([26, 11, 9], short_id, public_key.as_ref().to_vec())
++                    .build_browser_client_config(profile, RootCertStore::empty())
++                    .unwrap();
++            config.alpn_protocols = vec![b"h2".as_slice().into(), b"http/1.1".as_slice().into()];
++            let hello = parse_client_hello(&first_client_hello_bytes(config));
++            assert_eq!(normalize_grease(&hello.cipher_suites), ciphers);
++            assert_eq!(normalize_grease(&hello.supported_groups), groups);
++            assert_eq!(normalize_grease(&hello.key_share_groups), shares);
++            let on_wire_extensions: Vec<_> = normalize_grease(&hello.extension_types)
++                .into_iter()
++                .filter(|extension| *extension != 0x001b)
++                .collect();
++            assert_eq!(on_wire_extensions, extensions);
++            assert_eq!(hello.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
++            assert_ne!(hello.session_id, [0; 32]);
++        }
++    }
++
++    #[test]
++    fn outbound_firefox_completes_handshake_when_peer_selects_p256() {
++        let private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
++        let public_key = private_key.compute_public_key().unwrap();
++        let client_config =
++            RealitySessionIdConfig::new([26, 11, 9], [1], public_key.as_ref().to_vec())
++                .build_browser_client_config(ClientHelloProfile::Firefox148, test_root_store())
++                .unwrap();
++        let mut provider = crate::DEFAULT_TLS13_PROVIDER.clone();
++        provider.kx_groups = Cow::Owned(vec![crate::kx_group::SECP256R1]);
++        let server_config = ServerConfig::builder(Arc::new(provider))
++            .with_no_client_auth()
++            .with_single_cert(test_server_identity(), test_server_key())
++            .unwrap();
++        let mut client_output = Vec::new();
++        let mut client = Arc::new(client_config)
++            .connect(ServerName::try_from("localhost").unwrap())
++            .build(&mut client_output)
++            .unwrap();
++        let mut server = Connection::new(Arc::new(server_config)).unwrap();
++        do_handshake(
++            &mut VecInput::default(),
++            &mut client_output,
++            &mut client,
++            &mut VecInput::default(),
++            &mut Vec::new(),
++            &mut server,
++        );
++        assert_eq!(
++            client.negotiated_key_exchange_group().unwrap().name(),
++            NamedGroup::secp256r1
++        );
++    }
++
+     #[test]
+     fn reality_client_hello_profile_wire_baseline() {
+         for profile in [
+@@ -1481,6 +1630,43 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn reality_server_verifier_accepts_go_cert_without_san_only_with_authentication() {
++        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
++        let certificate = rcgen::CertificateParams::new(vec![])
++            .unwrap()
++            .self_signed(&key)
++            .unwrap();
++        let mut der = certificate.der().to_vec();
++        let auth_key = [0xa1; 32];
++        let public_key = key.public_key_raw().try_into().unwrap();
++        replace_outer_signature(
++            &mut der,
++            &reality_certificate_signature(&auth_key, public_key),
++        )
++        .unwrap();
++        let identity = Identity::from_cert_chain(vec![CertificateDer::from(der)]).unwrap();
++        let hostname = ServerName::try_from("example.test").unwrap();
++        let verifier = RealityServerVerifier::new(Arc::new(RejectingVerifier));
++        let server = ServerIdentity::new(&identity, &hostname, UnixTime::now());
++        assert!(
++            verifier
++                .verify_identity(&server)
++                .is_err()
++        );
++        assert!(
++            verifier
++                .verify_identity(&server.with_reality_auth_key(&auth_key))
++                .is_ok()
++        );
++        let server = ServerIdentity::new(&identity, &hostname, UnixTime::now());
++        assert!(
++            verifier
++                .verify_identity(&server.with_reality_auth_key(&[0xb2; 32]))
++                .is_err()
++        );
++    }
++
+     #[test]
+     fn install_helper_sets_a_sealed_client_hello_session_id() {
+         let server_private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+diff --git a/rustls/src/client/config.rs b/rustls/src/client/config.rs
+index 8b67f8ba..3295a4cc 100644
+--- a/rustls/src/client/config.rs
++++ b/rustls/src/client/config.rs
+@@ -203,6 +203,10 @@ pub enum ClientHelloProfile {
+     Chrome,
+     /// Current Firefox-like ordering.
+     Firefox,
++    /// Firefox 148-derived ordering, limited to implemented algorithms and extensions.
++    Firefox148,
++    /// Edge 85-derived ordering, retaining the provider's supported TLS versions and key shares.
++    Edge,
+     /// Current Safari-like ordering.
+     Safari,
+ }
+@@ -211,7 +215,7 @@ impl ClientHelloProfile {
+     pub(crate) fn cipher_suites(self) -> &'static [CipherSuite] {
+         match self {
+             Self::Default => &[],
+-            Self::Chrome | Self::Safari => &[
++            Self::Chrome | Self::Safari | Self::Edge => &[
+                 CipherSuite::TLS13_AES_128_GCM_SHA256,
+                 CipherSuite::TLS13_AES_256_GCM_SHA384,
+                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+@@ -233,6 +237,17 @@ impl ClientHelloProfile {
+                 CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                 CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+             ],
++            Self::Firefox148 => &[
++                CipherSuite::TLS13_AES_128_GCM_SHA256,
++                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
++                CipherSuite::TLS13_AES_256_GCM_SHA384,
++                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
++                CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
++                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++                CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++            ],
+         }
+     }
+
+@@ -246,6 +261,18 @@ impl ClientHelloProfile {
+                 NamedGroup::secp384r1,
+             ],
+             Self::Safari => &[NamedGroup::X25519, NamedGroup::secp256r1],
++            Self::Firefox148 => &[
++                NamedGroup::X25519MLKEM768,
++                NamedGroup::X25519,
++                NamedGroup::secp256r1,
++                NamedGroup::secp384r1,
++            ],
++            Self::Edge => &[
++                NamedGroup::X25519MLKEM768,
++                NamedGroup::X25519,
++                NamedGroup::secp256r1,
++                NamedGroup::secp384r1,
++            ],
+         }
+     }
+
+@@ -259,6 +286,28 @@ impl ClientHelloProfile {
+                 SignatureScheme::RSA_PSS_SHA384,
+                 SignatureScheme::ED25519,
+             ],
++            Self::Firefox148 => &[
++                SignatureScheme::ECDSA_NISTP256_SHA256,
++                SignatureScheme::ECDSA_NISTP384_SHA384,
++                SignatureScheme::ECDSA_NISTP521_SHA512,
++                SignatureScheme::RSA_PSS_SHA256,
++                SignatureScheme::RSA_PSS_SHA384,
++                SignatureScheme::RSA_PSS_SHA512,
++                SignatureScheme::RSA_PKCS1_SHA256,
++                SignatureScheme::RSA_PKCS1_SHA384,
++                SignatureScheme::RSA_PKCS1_SHA512,
++                SignatureScheme::ED25519,
++            ],
++            Self::Edge => &[
++                SignatureScheme::ECDSA_NISTP256_SHA256,
++                SignatureScheme::RSA_PSS_SHA256,
++                SignatureScheme::RSA_PKCS1_SHA256,
++                SignatureScheme::ECDSA_NISTP384_SHA384,
++                SignatureScheme::RSA_PSS_SHA384,
++                SignatureScheme::RSA_PKCS1_SHA384,
++                SignatureScheme::RSA_PSS_SHA512,
++                SignatureScheme::RSA_PKCS1_SHA512,
++            ],
+             Self::Firefox => &[
+                 SignatureScheme::ECDSA_NISTP256_SHA256,
+                 SignatureScheme::ECDSA_NISTP384_SHA384,
+@@ -286,6 +335,41 @@ impl ClientHelloProfile {
+                 ExtensionType::PSKKeyExchangeModes,
+                 ExtensionType::KeyShare,
+             ],
++            Self::Firefox148 => &[
++                ExtensionType::ServerName,
++                ExtensionType::ExtendedMainSecret,
++                ExtensionType::RenegotiationInfo,
++                ExtensionType::EllipticCurves,
++                ExtensionType::ECPointFormats,
++                ExtensionType::ALProtocolNegotiation,
++                ExtensionType::StatusRequest,
++                ExtensionType::DelegatedCredentials,
++                ExtensionType::SCT,
++                ExtensionType::KeyShare,
++                ExtensionType::SupportedVersions,
++                ExtensionType::SignatureAlgorithms,
++                ExtensionType::PSKKeyExchangeModes,
++                ExtensionType::RecordSizeLimit,
++                ExtensionType::CompressCertificate,
++            ],
++            Self::Edge => &[
++                ExtensionType::GREASE,
++                ExtensionType::ServerName,
++                ExtensionType::ExtendedMainSecret,
++                ExtensionType::RenegotiationInfo,
++                ExtensionType::EllipticCurves,
++                ExtensionType::ECPointFormats,
++                ExtensionType::SessionTicket,
++                ExtensionType::ALProtocolNegotiation,
++                ExtensionType::StatusRequest,
++                ExtensionType::SignatureAlgorithms,
++                ExtensionType::SCT,
++                ExtensionType::KeyShare,
++                ExtensionType::PSKKeyExchangeModes,
++                ExtensionType::SupportedVersions,
++                ExtensionType::CompressCertificate,
++                ExtensionType::GREASE_TAIL,
++            ],
+             Self::Firefox => &[
+                 ExtensionType::ServerName,
+                 ExtensionType::GREASE,
+@@ -313,7 +397,11 @@ impl ClientHelloProfile {
+     }
+
+     pub(crate) fn uses_grease(self) -> bool {
+-        !matches!(self, Self::Default)
++        !matches!(self, Self::Default | Self::Firefox148)
++    }
++
++    pub(crate) fn sends_renegotiation_info(self) -> bool {
++        matches!(self, Self::Firefox148 | Self::Edge)
+     }
+ }
+
+diff --git a/rustls/src/client/ech.rs b/rustls/src/client/ech.rs
+index 2fb313b2..18c489a7 100644
+--- a/rustls/src/client/ech.rs
++++ b/rustls/src/client/ech.rs
+@@ -1309,6 +1309,7 @@ mod tests {
+             extensions: Box::new(ClientExtensions {
+                 server_name: Some(ServerNamePayload::from(&public_name())),
+                 supported_versions: Some(SupportedProtocolVersions {
++                    grease: None,
+                     tls13: true,
+                     tls12: false,
+                 }),
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index c4c27be3..32dbdb3a 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -10,17 +10,19 @@ use pki_types::ServerName;
+ use super::config::{ClientHelloCallbackContext, ClientSessionKey, Tls12Resumption};
+ use super::ech::{EchMode, EchState, EchStatus};
+ use super::{
+-    ClientHelloDetails, ClientSessionCommon, ClientSide, Retrieved, Tls12Session, Tls13Session,
+-    tls13,
++    ClientHelloDetails, ClientHelloProfile, ClientSessionCommon, ClientSide, Retrieved,
++    Tls12Session, Tls13Session, tls13,
+ };
+ use crate::check::inappropriate_handshake_message;
+ use crate::common_state::{EarlyDataEvent, Event, Output, OutputEvent, Protocol};
+ use crate::conn::{Input, State, StateMachine, VerifySidePeerIdentity};
+ use crate::crypto::cipher::{EncodableVersion, Payload};
++use crate::crypto::hpke::{HpkeAead, HpkeKdf, HpkeSymmetricCipherSuite};
+ use crate::crypto::kx::{KeyExchangeAlgorithm, NamedGroup, StartedKeyExchange, SupportedKxGroup};
+-use crate::crypto::{CipherSuite, CryptoProvider, rand};
++use crate::crypto::{CipherSuite, CryptoProvider, SignatureScheme, rand};
+ use crate::enums::{
+-    ApplicationProtocol, CertificateType, ContentType, HandshakeType, ProtocolVersion,
++    ApplicationProtocol, CertificateCompressionAlgorithm, CertificateType, ContentType,
++    HandshakeType, ProtocolVersion,
+ };
+ use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHashBuffer;
+@@ -28,10 +30,10 @@ use crate::kernel::KernelState;
+ use crate::msgs::{
+     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
+     ClientSessionTicket, ClientTicketRequest, Codec, Compression, EncryptedClientHello,
+-    ExtensionType, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, KeyShareEntry,
+-    Message, MessagePayload, PskKeyExchangeModes, Random, Reader, ServerHelloPayload,
+-    ServerNamePayload, SessionId, SupportedEcPointFormats, SupportedProtocolVersions,
+-    TransportParameters,
++    EncryptedClientHelloOuter, ExtensionType, HandshakeMessagePayload, HandshakePayload,
++    HelloRetryRequest, KeyShareEntry, Message, MessagePayload, PskKeyExchangeModes, Random, Reader,
++    ServerHelloPayload, ServerNamePayload, SessionId, SupportedEcPointFormats,
++    SupportedProtocolVersions, TransportParameters,
+ };
+ use crate::sealed::Sealed;
+ use crate::suites::{PartiallyExtractedSecrets, Suite, SupportedCipherSuite};
+@@ -123,6 +125,7 @@ pub(crate) struct ExpectServerHello {
+     // If this is `None` then we do not support early data.
+     pub(super) early_data_key_schedule: Option<(KeyScheduleEarlyClient, bool)>,
+     pub(super) offered_key_share: Option<GroupAndKeyShare>,
++    pub(super) additional_key_share: Option<GroupAndKeyShare>,
+     pub(super) suite: Option<SupportedCipherSuite>,
+     pub(super) ech_state: Option<EchState>,
+     pub(super) ech_status: EchStatus,
+@@ -308,7 +311,14 @@ impl ExpectServerHelloOrHelloRetryRequest {
+                 .as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
+                 .map(|(hybrid, _)| hybrid.component().0);
+
+-            if req_group == offered_key_share.share.group() || Some(req_group) == offered_hybrid {
++            if req_group == offered_key_share.share.group()
++                || Some(req_group) == offered_hybrid
++                || self
++                    .next
++                    .additional_key_share
++                    .as_ref()
++                    .is_some_and(|share| req_group == share.share.group())
++            {
+                 return Err(PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup.into());
+             }
+         }
+@@ -583,6 +593,38 @@ fn grease_value(secure_random: &dyn crate::crypto::SecureRandom) -> Result<u16,
+     Ok(nibble * 0x1010 + 0x0a0a)
+ }
+
++fn firefox_reality_grease_ech(provider: &CryptoProvider) -> Result<EncryptedClientHello, Error> {
++    // The Firefox uTLS profile sends a dummy X25519 encapsulation and a
++    // 223-byte inner payload plus the AEAD's 16-byte tag.
++    let x25519 = provider
++        .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
++        .ok_or(Error::Unreachable("Firefox REALITY requires X25519"))?
++        .start()?
++        .into_single();
++    let mut header = [0u8; 2];
++    let mut payload = vec![0u8; 239];
++    provider
++        .secure_random
++        .fill(&mut header)?;
++    provider
++        .secure_random
++        .fill(&mut payload)?;
++
++    Ok(EncryptedClientHello::Outer(EncryptedClientHelloOuter {
++        config_id: header[0],
++        cipher_suite: HpkeSymmetricCipherSuite {
++            kdf_id: HpkeKdf::HKDF_SHA256,
++            aead_id: if header[1] & 1 == 0 {
++                HpkeAead::AES_128_GCM
++            } else {
++                HpkeAead::CHACHA20_POLY_1305
++            },
++        },
++        enc: x25519.pub_key().to_vec().into(),
++        payload: payload.into(),
++    }))
++}
++
+ fn emit_client_hello_for_retry(
+     mut transcript_buffer: HandshakeHashBuffer,
+     retryreq: Option<&HelloRetryRequest>,
+@@ -600,11 +642,33 @@ fn emit_client_hello_for_retry(
+         .uses_grease()
+         .then(|| grease_value(config.provider().secure_random))
+         .transpose()?;
++    let edge_profile = config.client_hello_profile == ClientHelloProfile::Edge;
++    let firefox_profile = config.client_hello_profile == ClientHelloProfile::Firefox148;
++    let reality_browser_hello =
++        config.client_hello_callback().is_some() && retryreq.is_none() && !input.protocol.is_quic();
++    let edge_grease = reality_browser_hello && edge_profile;
++    let grease_group = if edge_grease {
++        Some(grease_value(config.provider().secure_random)?)
++    } else {
++        grease
++    };
++    let grease_cipher = if edge_grease {
++        Some(grease_value(config.provider().secure_random)?)
++    } else {
++        grease
++    };
+     // Defense in depth: the ECH state should be None if ECH is disabled based on config
+     // builder semantics.
+     let forbids_tls12 = input.protocol.is_quic() || ech_state.is_some();
+
+     let supported_versions = SupportedProtocolVersions {
++        grease: if edge_grease {
++            Some(ProtocolVersion(grease_value(
++                config.provider().secure_random,
++            )?))
++        } else {
++            None
++        },
+         tls13: config.supports_version(ProtocolVersion::TLSv1_3, input.protocol),
+         tls12: config.supports_version(ProtocolVersion::TLSv1_2, input.protocol) && !forbids_tls12,
+     };
+@@ -613,13 +677,13 @@ fn emit_client_hello_for_retry(
+     assert!(supported_versions.any(|_| true));
+
+     let mut exts = Box::new(ClientExtensions {
+-        certificate_status_request: match config
++        certificate_status_request: (config
+             .verifier()
+             .request_ocsp_response()
+-        {
+-            true => Some(CertificateStatusRequest::build_ocsp()),
+-            false => None,
+-        },
++            || config
++                .client_hello_profile
++                .sends_renegotiation_info())
++        .then(CertificateStatusRequest::build_ocsp),
+         // offer groups which are usable for any offered version
+         named_groups: Some(
+             match config
+@@ -637,21 +701,33 @@ fn emit_client_hello_for_retry(
+                             .then_some(named_group)
+                     })
+                     .collect(),
+-                preferred => preferred
+-                    .iter()
+-                    .filter(|named_group| {
+-                        config
+-                            .provider()
+-                            .kx_groups
+-                            .iter()
+-                            .any(|skxg| {
+-                                skxg.name() == **named_group
+-                                    && supported_versions.any(|v| named_group.usable_for_version(v))
+-                            })
+-                    })
+-                    .copied()
+-                    .chain(grease.map(NamedGroup))
+-                    .collect(),
++                preferred => {
++                    let supported = preferred
++                        .iter()
++                        .copied()
++                        .filter(|named_group| {
++                            config
++                                .provider()
++                                .kx_groups
++                                .iter()
++                                .any(|skxg| {
++                                    skxg.name() == *named_group
++                                        && supported_versions
++                                            .any(|v| named_group.usable_for_version(v))
++                                })
++                        });
++                    if edge_profile {
++                        grease_group
++                            .map(NamedGroup)
++                            .into_iter()
++                            .chain(supported)
++                            .collect()
++                    } else {
++                        supported
++                            .chain(grease.map(NamedGroup))
++                            .collect()
++                    }
++                }
+             },
+         ),
+         signature_schemes: Some(
+@@ -687,6 +763,13 @@ fn emit_client_hello_for_retry(
+         exts.grease_extension = Some(ExtensionType(grease.expect("GREASE value is present")));
+     }
+
++    if config
++        .client_hello_profile
++        .sends_renegotiation_info()
++    {
++        exts.renegotiation_info = Some(Vec::new().into());
++    }
++
+     if config
+         .provider()
+         .tls13_cipher_suites
+@@ -735,6 +818,7 @@ fn emit_client_hello_for_retry(
+         (None, false) => None,
+     };
+
++    let mut additional_key_share = None;
+     if let Some(GroupAndKeyShare { share, .. }) = &key_share {
+         debug_assert!(supported_versions.tls13);
+         let mut shares = vec![KeyShareEntry::new(share.group(), share.pub_key())];
+@@ -755,6 +839,27 @@ fn emit_client_hello_for_retry(
+             }
+         }
+
++        if reality_browser_hello
++            && firefox_profile
++            && let Some(group) = config
++                .provider()
++                .find_kx_group(NamedGroup::secp256r1, ProtocolVersion::TLSv1_3)
++            && !shares
++                .iter()
++                .any(|share| share.group == NamedGroup::secp256r1)
++        {
++            let extra_share = GroupAndKeyShare::new(group)?;
++            shares.push(KeyShareEntry::new(
++                extra_share.share.group(),
++                extra_share.share.pub_key(),
++            ));
++            additional_key_share = Some(extra_share);
++        }
++
++        if edge_profile {
++            let grease_group = NamedGroup(grease_group.expect("GREASE value is present"));
++            shares.insert(0, KeyShareEntry::new(grease_group, &[0]));
++        }
+         exts.key_shares = Some(shares);
+     }
+
+@@ -836,6 +941,61 @@ fn emit_client_hello_for_retry(
+         _ => (None, false),
+     };
+
++    if reality_browser_hello {
++        if edge_profile || firefox_profile {
++            exts.sct_request = Some(());
++        }
++        if edge_profile {
++            exts.session_ticket
++                .get_or_insert(ClientSessionTicket::Request);
++            let first = grease.expect("Edge sends GREASE");
++            let mut second = grease_value(config.provider().secure_random)?;
++            if second == first {
++                second ^= 0x1010;
++            }
++            exts.grease_extension_tail = Some(ExtensionType(second));
++        }
++        if firefox_profile {
++            // The Go uTLS Firefox profile carries legacy capabilities on the wire.
++            // Keep the REALITY engine TLS 1.3-only; do not enable TLS 1.2, legacy
++            // groups, SHA-1 verification, delegated credentials or decompression here.
++            exts.supported_versions = Some(SupportedProtocolVersions {
++                tls12: true,
++                ..supported_versions
++            });
++            exts.named_groups = Some(
++                [0x11ec, 0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101]
++                    .into_iter()
++                    .map(NamedGroup)
++                    .collect(),
++            );
++            exts.signature_schemes = Some(
++                [
++                    0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
++                    0x0601, 0x0203, 0x0201,
++                ]
++                .into_iter()
++                .map(SignatureScheme)
++                .collect(),
++            );
++            exts.delegated_credentials = Some(
++                [0x0403, 0x0503, 0x0603, 0x0203]
++                    .into_iter()
++                    .map(SignatureScheme)
++                    .collect(),
++            );
++            exts.certificate_compression_algorithms = Some(vec![
++                CertificateCompressionAlgorithm::Zlib,
++                CertificateCompressionAlgorithm::Brotli,
++                CertificateCompressionAlgorithm::Zstd,
++            ]);
++            exts.record_size_limit = Some(0x4001);
++            if exts.preshared_key_offer.is_none() {
++                exts.preshared_key_modes = None;
++            }
++        }
++    }
++
+     exts.set_extension_order(
+         config
+             .client_hello_profile
+@@ -874,14 +1034,32 @@ fn emit_client_hello_for_retry(
+         .client_hello_profile
+         .uses_grease()
+     {
+-        cipher_suites.insert(0, CipherSuite(grease.expect("GREASE value is present")));
++        cipher_suites.insert(
++            0,
++            CipherSuite(grease_cipher.expect("GREASE value is present")),
++        );
+     }
+
+-    if supported_versions.tls12 {
++    if supported_versions.tls12
++        && !config
++            .client_hello_profile
++            .sends_renegotiation_info()
++    {
+         // We don't do renegotiation at all, in fact.
+         cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+     }
+
++    if reality_browser_hello && firefox_profile {
++        cipher_suites.extend(
++            [
++                0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a, 0xc009, 0xc013,
++                0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
++            ]
++            .into_iter()
++            .map(CipherSuite),
++        );
++    }
++
+     let mut chp_payload = ClientHelloPayload {
+         client_version: ProtocolVersion::TLSv1_2,
+         random: input.random,
+@@ -891,7 +1069,7 @@ fn emit_client_hello_for_retry(
+         extensions: exts,
+     };
+
+-    let ech_grease_ext = config
++    let mut ech_grease_ext = config
+         .ech_mode
+         .as_ref()
+         .and_then(|mode| match mode {
+@@ -903,6 +1081,10 @@ fn emit_client_hello_for_retry(
+             _ => None,
+         });
+
++    if reality_browser_hello && firefox_profile && config.ech_mode.is_none() {
++        ech_grease_ext = Some(firefox_reality_grease_ech(config.provider()));
++    }
++
+     match (ech_status, &mut ech_state) {
+         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
+         // we need to replace the client hello payload with an ECH client hello payload.
+@@ -1080,6 +1262,7 @@ fn emit_client_hello_for_retry(
+         transcript_buffer,
+         early_data_key_schedule,
+         offered_key_share: key_share,
++        additional_key_share,
+         suite,
+         ech_state,
+         ech_status,
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 0659961e..e4e7afd5 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -127,7 +127,11 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
+         };
+
+         // We always send a key share when TLS 1.3 is enabled.
+-        let our_key_share = st.offered_key_share.unwrap();
++        let our_key_share = st
++            .additional_key_share
++            .filter(|share| share.share.group() == their_key_share.group)
++            .or(st.offered_key_share)
++            .unwrap();
+         let our_key_share = KeyExchangeChoice::new(&config, output, our_key_share, their_key_share)
+             .map_err(|_| PeerMisbehaved::WrongGroupForKeyShare)?;
+
+diff --git a/rustls/src/crypto/kx/mod.rs b/rustls/src/crypto/kx/mod.rs
+index 1f640ff1..a2b06e8b 100644
+--- a/rustls/src/crypto/kx/mod.rs
++++ b/rustls/src/crypto/kx/mod.rs
+@@ -129,6 +129,11 @@ impl ActiveKeyExchange for ActiveHybrid {
+         &self.combined_pub_key
+     }
+
++    fn extract_reality_key(&self, server_pub_key: &[u8]) -> Option<Vec<u8>> {
++        self.classical
++            .extract_reality_key(server_pub_key)
++    }
++
+     fn group(&self) -> NamedGroup {
+         self.name
+     }
+diff --git a/rustls/src/msgs/client_hello.rs b/rustls/src/msgs/client_hello.rs
+index 7837d0b4..d540571b 100644
+--- a/rustls/src/msgs/client_hello.rs
++++ b/rustls/src/msgs/client_hello.rs
+@@ -179,10 +179,22 @@ extension_struct! {
+         ExtensionType::ExtendedMainSecret =>
+             pub(crate) extended_main_secret_request: Option<()>,
+
++        /// Request signed certificate timestamps (RFC 6962).
++        ExtensionType::SCT =>
++            pub(crate) sct_request: Option<()>,
++
++        /// Record size advertised by the client (RFC 8449).
++        ExtensionType::RecordSizeLimit =>
++            pub(crate) record_size_limit: Option<u16>,
++
+         /// Offered certificate compression methods (RFC 8879)
+         ExtensionType::CompressCertificate =>
+             pub(crate) certificate_compression_algorithms: Option<Vec<CertificateCompressionAlgorithm>>,
+
++        /// Delegated credential signature schemes (RFC 9345).
++        ExtensionType::DelegatedCredentials =>
++            pub(crate) delegated_credentials: Option<Vec<SignatureScheme>>,
++
+         /// Session ticket offer or request (RFC 5077)
+         ExtensionType::SessionTicket =>
+             pub(crate) session_ticket: Option<ClientSessionTicket>,
+@@ -244,19 +256,23 @@ extension_struct! {
+
+         /// The per-ClientHello GREASE extension type, when enabled.
+         pub(crate) grease_extension: Option<ExtensionType>,
++
++        /// Browser profiles may send a second GREASE extension with a one-byte body.
++        pub(crate) grease_extension_tail: Option<ExtensionType>,
+     }
+ }
+
+ impl ClientExtensions<'_> {
+     pub(crate) fn set_extension_order(&mut self, preferred: &[ExtensionType]) {
+         let mut used = self.collect_used();
+-        if let Some(grease) = self.grease_extension {
+-            used.push(grease);
+-        }
++        used.extend(self.grease_extension);
++        used.extend(self.grease_extension_tail);
+         self.contiguous_extensions = preferred
+             .iter()
+             .filter_map(|extension| {
+-                if extension.is_grease() {
++                if *extension == ExtensionType::GREASE_TAIL {
++                    self.grease_extension_tail
++                } else if extension.is_grease() {
+                     self.grease_extension
+                 } else {
+                     Some(*extension)
+@@ -294,6 +310,10 @@ impl ClientExtensions<'_> {
+             order_seed,
+             contiguous_extensions,
+             grease_extension,
++            grease_extension_tail,
++            sct_request,
++            record_size_limit,
++            delegated_credentials,
+         } = self;
+         ClientExtensions {
+             server_name: server_name.map(|x| x.into_owned()),
+@@ -326,6 +346,10 @@ impl ClientExtensions<'_> {
+             order_seed,
+             contiguous_extensions,
+             grease_extension,
++            grease_extension_tail,
++            sct_request,
++            record_size_limit,
++            delegated_credentials,
+         }
+     }
+
+@@ -363,9 +387,8 @@ impl ClientExtensions<'_> {
+     ///   are required to be last by the standard.
+     fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
+         let mut order = self.collect_used();
+-        if let Some(grease) = self.grease_extension {
+-            order.push(grease);
+-        }
++        order.extend(self.grease_extension);
++        order.extend(self.grease_extension_tail);
+
+         // Remove extensions which have specific order requirements.
+         order.retain(|ext| {
+@@ -399,6 +422,9 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
+             if self.grease_extension == Some(item) {
+                 item.encode(body.buf);
+                 ().encode(LengthPrefixedBuffer::new(ListLength::U16, body.buf).buf);
++            } else if self.grease_extension_tail == Some(item) {
++                item.encode(body.buf);
++                0u8.encode(LengthPrefixedBuffer::new(ListLength::U16, body.buf).buf);
+             } else {
+                 self.encode_one(item, body.buf);
+             }
+diff --git a/rustls/src/msgs/enums.rs b/rustls/src/msgs/enums.rs
+index d2d41e55..0eca8de4 100644
+--- a/rustls/src/msgs/enums.rs
++++ b/rustls/src/msgs/enums.rs
+@@ -60,6 +60,8 @@ enum_builder! {
+         ClientCertificateType => 0x0013,
+         ServerCertificateType => 0x0014,
+         Padding => 0x0015,
++        RecordSizeLimit => 0x001c,
++        DelegatedCredentials => 0x0022,
+         ExtendedMainSecret => 0x0017,
+         CompressCertificate => 0x001b,
+         SessionTicket => 0x0023,
+@@ -87,6 +89,7 @@ enum_builder! {
+ impl ExtensionType {
+     /// The reserved GREASE extension value from RFC 8701.
+     pub(crate) const GREASE: Self = Self(0x0a0a);
++    pub(crate) const GREASE_TAIL: Self = Self(0x1a1a);
+
+     pub(crate) fn is_grease(self) -> bool {
+         u16::from(self) & 0x0f0f == 0x0a0a
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index 95791594..d7ce4d32 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -287,6 +287,7 @@ impl TlsListElement for KeyShareEntry {
+ /// RFC 9846: `ProtocolVersion versions<2..254>;`
+ #[derive(Clone, Copy, Debug, Default)]
+ pub(crate) struct SupportedProtocolVersions {
++    pub(crate) grease: Option<ProtocolVersion>,
+     pub(crate) tls13: bool,
+     pub(crate) tls12: bool,
+ }
+@@ -311,6 +312,9 @@ impl SupportedProtocolVersions {
+ impl Codec<'_> for SupportedProtocolVersions {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         let inner = LengthPrefixedBuffer::new(Self::LIST_LENGTH, bytes);
++        if let Some(grease) = self.grease {
++            grease.encode(inner.buf);
++        }
+         if self.tls13 {
+             ProtocolVersion::TLSv1_3.encode(inner.buf);
+         }
+@@ -331,7 +335,11 @@ impl Codec<'_> for SupportedProtocolVersions {
+             };
+         }
+
+-        Ok(Self { tls13, tls12 })
++        Ok(Self {
++            grease: None,
++            tls13,
++            tls12,
++        })
+     }
+ }
+
+diff --git a/rustls/src/msgs/handshake_test.rs b/rustls/src/msgs/handshake_test.rs
+index 88775502..fc6a45d6 100644
+--- a/rustls/src/msgs/handshake_test.rs
++++ b/rustls/src/msgs/handshake_test.rs
+@@ -1174,6 +1174,7 @@ fn sample_client_hello_payload() -> ClientHelloPayload {
+             named_groups: Some(vec![NamedGroup::X25519]),
+             protocols: Some(vec![ApplicationProtocol::from(vec![0])]),
+             supported_versions: Some(SupportedProtocolVersions {
++                grease: None,
+                 tls13: true,
+                 ..Default::default()
+             }),
+diff --git a/rustls/src/server/test.rs b/rustls/src/server/test.rs
+index 37c24a7d..e9b6ac83 100644
+--- a/rustls/src/server/test.rs
++++ b/rustls/src/server/test.rs
+@@ -808,6 +808,7 @@ fn minimal_client_hello() -> ClientHelloPayload {
+             signature_schemes: Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
+             named_groups: Some(vec![NamedGroup::from(0xfe00)]),
+             supported_versions: Some(SupportedProtocolVersions {
++                grease: None,
+                 tls12: true,
+                 tls13: true,
+             }),
 diff --git a/rustls/src/webpki/client_verifier.rs b/rustls/src/webpki/client_verifier.rs
-index 1af822c..6a5ad61 100644
+index 1af822c7..6a5ad612 100644
 --- a/rustls/src/webpki/client_verifier.rs
 +++ b/rustls/src/webpki/client_verifier.rs
 @@ -313,7 +313,7 @@ impl WebPkiClientVerifier {
@@ -120,7 +1113,7 @@ index 1af822c..6a5ad61 100644
 @@ -353,18 +353,16 @@ impl ClientVerifier for WebPkiClientVerifier {
              )
          };
- 
+
 -        cert.0
 -            .verify_for_usage(
 -                self.supported_algs.all,
@@ -144,10 +1137,10 @@ index 1af822c..6a5ad61 100644
 +        .map_err(pki_error)
 +        .map(|_| VerifiedIdentity::assertion(identity.identity.clone()))
      }
- 
+
      fn verify_tls12_signature(
 diff --git a/rustls/src/webpki/verify.rs b/rustls/src/webpki/verify.rs
-index 67eca51..4c3d554 100644
+index 67eca519..4c3d554d 100644
 --- a/rustls/src/webpki/verify.rs
 +++ b/rustls/src/webpki/verify.rs
 @@ -186,15 +186,14 @@ pub(crate) fn verify_identity_signed_by_trust_anchor_impl(

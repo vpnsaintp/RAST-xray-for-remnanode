@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use aws_lc_rs::digest::{SHA256, digest};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use rustls::client::ClientHelloProfile;
 use rustls::client::danger::{
     HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
     VerifiedIdentity,
@@ -415,9 +416,10 @@ pub struct VlessProxy {
 #[derive(Clone)]
 enum VlessSecurity {
     Plain,
-    PinnedTls {
+    Tls {
         config: Arc<ClientConfig>,
         name: ServerName<'static>,
+        reality: bool,
     },
 }
 
@@ -462,6 +464,7 @@ struct CascadeStream {
     #[serde(default)]
     security: String,
     tls_settings: Option<CascadeTls>,
+    reality_settings: Option<CascadeReality>,
     #[serde(default)]
     sockopt: OutboundSockopt,
 }
@@ -472,6 +475,22 @@ struct CascadeTls {
     #[serde(default)]
     server_name: Option<String>,
     pinned_peer_cert_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CascadeReality {
+    server_name: String,
+    #[serde(alias = "password")]
+    public_key: String,
+    #[serde(default)]
+    short_id: String,
+    #[serde(default)]
+    fingerprint: String,
+    #[serde(default)]
+    spider_x: String,
+    #[serde(default)]
+    show: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -541,16 +560,32 @@ impl VlessProxy {
         let security = match stream.security.as_str() {
             "" | "none" => {
                 ensure!(
-                    stream.tls_settings.is_none(),
-                    "TLS settings on a plain VLESS cascade"
+                    stream.tls_settings.is_none() && stream.reality_settings.is_none(),
+                    "security settings on a plain VLESS cascade"
                 );
-                ensure!(!vision, "Vision requires TLS on the VLESS cascade");
+                ensure!(!vision, "Vision requires TLS or REALITY on the VLESS cascade");
                 VlessSecurity::Plain
             }
-            "tls" => stream
-                .tls_settings
-                .context("missing TLS settings for VLESS cascade")?
-                .compile(&server.address)?,
+            "tls" => {
+                ensure!(
+                    stream.reality_settings.is_none(),
+                    "REALITY settings on a TLS cascade"
+                );
+                stream
+                    .tls_settings
+                    .context("missing TLS settings for VLESS cascade")?
+                    .compile(&server.address)?
+            }
+            "reality" => {
+                ensure!(
+                    stream.tls_settings.is_none(),
+                    "TLS settings on a REALITY cascade"
+                );
+                stream
+                    .reality_settings
+                    .context("missing REALITY settings for VLESS cascade")?
+                    .compile()?
+            }
             _ => bail!("unsupported VLESS cascade security"),
         };
         Ok(Self {
@@ -574,7 +609,7 @@ impl VlessProxy {
         self.sockopt.apply_tcp(&socket)?;
         let mut stream = match &self.security {
             VlessSecurity::Plain => VlessStream::Plain(socket),
-            VlessSecurity::PinnedTls { config, name } => {
+            VlessSecurity::Tls { config, name, .. } => {
                 VlessStream::Tls(TlsStream::connect(socket, config.clone(), name.clone()).await?)
             }
         };
@@ -625,9 +660,45 @@ impl CascadeTls {
             .with_custom_certificate_verifier(Arc::new(Pins { pins, algorithms }))
             .with_no_client_auth()?;
         tls.alpn_protocols = vec![b"h2".as_slice().into(), b"http/1.1".as_slice().into()];
-        Ok(VlessSecurity::PinnedTls {
+        Ok(VlessSecurity::Tls {
             config: Arc::new(tls),
             name,
+            reality: false,
+        })
+    }
+}
+
+impl CascadeReality {
+    fn compile(self) -> Result<VlessSecurity> {
+        ensure!(
+            self.fingerprint == "firefox",
+            "unsupported REALITY fingerprint: expected firefox"
+        );
+        ensure!(
+            matches!(self.spider_x.as_str(), "" | "/") && !self.show,
+            "unsupported REALITY debug or spider settings"
+        );
+        validate_domain(&self.server_name)?;
+        let name = ServerName::try_from(self.server_name)?;
+        let version = [
+            env!("CARGO_PKG_VERSION_MAJOR").parse()?,
+            env!("CARGO_PKG_VERSION_MINOR").parse()?,
+            env!("CARGO_PKG_VERSION_PATCH").parse()?,
+        ];
+        let mut config = rustls_aws_lc_rs::reality::RealitySessionIdConfig::from_xray_fields(
+            version,
+            &self.short_id,
+            &self.public_key,
+        )?
+        .build_browser_client_config(
+            ClientHelloProfile::Firefox148,
+            rustls::RootCertStore::empty(),
+        )?;
+        config.alpn_protocols = vec![b"h2".as_slice().into(), b"http/1.1".as_slice().into()];
+        Ok(VlessSecurity::Tls {
+            config: Arc::new(config),
+            name,
+            reality: true,
         })
     }
 }
@@ -681,6 +752,8 @@ impl ServerVerifier for Pins {
 
 #[cfg(test)]
 mod send_through_tests {
+    use serde_json::json;
+
     use super::*;
     use tokio::net::{TcpListener, UdpSocket};
 
@@ -691,6 +764,75 @@ mod send_through_tests {
             Some(source.parse().unwrap()),
         )
         .unwrap()
+    }
+
+    fn vless_reality(fingerprint: &str, key_field: &str) -> Result<VlessProxy> {
+        let mut reality = json!({
+            "serverName": "example.com",
+            "shortId": "0102030405060708",
+            "fingerprint": fingerprint,
+            "spiderX": "/"
+        });
+        reality[key_field] = json!("IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI");
+        VlessProxy::compile(
+            json!({"vnext": [{
+                "address": "192.0.2.1",
+                "port": 443,
+                "users": [{
+                    "id": "ff207bb7-09ae-41ee-9a93-1da42158174c",
+                    "encryption": "none",
+                    "flow": "xtls-rprx-vision"
+                }]
+            }]}),
+            json!({
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": reality
+            }),
+        )
+    }
+
+    #[test]
+    fn accepts_remnawave_vless_reality_outbound_with_firefox() {
+        for key_field in ["publicKey", "password"] {
+            let outbound = vless_reality("firefox", key_field).unwrap();
+            assert!(outbound.vision);
+            let VlessSecurity::Tls {
+                config, reality, ..
+            } = outbound.security
+            else {
+                panic!("expected REALITY TLS security");
+            };
+            assert!(reality);
+            assert_eq!(config.client_hello_profile, ClientHelloProfile::Firefox148);
+        }
+    }
+
+    #[test]
+    fn rejects_non_firefox_or_mismatched_reality_settings() {
+        assert!(vless_reality("chrome", "publicKey").is_err());
+        assert!(
+            VlessProxy::compile(
+                json!({"vnext": [{
+                    "address": "192.0.2.1",
+                    "port": 443,
+                    "users": [{
+                        "id": "ff207bb7-09ae-41ee-9a93-1da42158174c",
+                        "encryption": "none"
+                    }]
+                }]}),
+                json!({
+                    "network": "tcp",
+                    "security": "tls",
+                    "realitySettings": {
+                        "serverName": "example.com",
+                        "publicKey": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+                        "fingerprint": "firefox"
+                    }
+                })
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -6,16 +6,27 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 type Endpoints = (SocketAddr, SocketAddr);
 
 pub fn encode(version: u8, source: SocketAddr, destination: SocketAddr) -> Result<Vec<u8>> {
-    ensure!(version == 1 || version == 2, "unsupported PROXY protocol version");
+    ensure!(
+        version == 1 || version == 2,
+        "unsupported PROXY protocol version"
+    );
     let bytes = match (version, source, destination) {
         (1, SocketAddr::V4(src), SocketAddr::V4(dst)) => format!(
             "PROXY TCP4 {} {} {} {}\r\n",
-            src.ip(), dst.ip(), src.port(), dst.port()
-        ).into_bytes(),
+            src.ip(),
+            dst.ip(),
+            src.port(),
+            dst.port()
+        )
+        .into_bytes(),
         (1, SocketAddr::V6(src), SocketAddr::V6(dst)) => format!(
             "PROXY TCP6 {} {} {} {}\r\n",
-            src.ip(), dst.ip(), src.port(), dst.port()
-        ).into_bytes(),
+            src.ip(),
+            dst.ip(),
+            src.port(),
+            dst.port()
+        )
+        .into_bytes(),
         (1, _, _) => b"PROXY UNKNOWN\r\n".to_vec(),
         (2, src, dst) => {
             let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
@@ -49,15 +60,28 @@ mod encode_tests {
 
     #[test]
     fn proxy_v1_ipv4() {
-        let header = encode(1, "192.0.2.1:1234".parse().unwrap(), "198.51.100.2:443".parse().unwrap()).unwrap();
+        let header = encode(
+            1,
+            "192.0.2.1:1234".parse().unwrap(),
+            "198.51.100.2:443".parse().unwrap(),
+        )
+        .unwrap();
         assert_eq!(header, b"PROXY TCP4 192.0.2.1 198.51.100.2 1234 443\r\n");
     }
 
     #[test]
     fn proxy_v2_ipv4() {
-        let header = encode(2, "192.0.2.1:1234".parse().unwrap(), "198.51.100.2:443".parse().unwrap()).unwrap();
+        let header = encode(
+            2,
+            "192.0.2.1:1234".parse().unwrap(),
+            "198.51.100.2:443".parse().unwrap(),
+        )
+        .unwrap();
         assert_eq!(&header[..16], b"\r\n\r\n\0\r\nQUIT\n\x21\x11\0\x0c");
-        assert_eq!(&header[16..], &[192, 0, 2, 1, 198, 51, 100, 2, 4, 210, 1, 187]);
+        assert_eq!(
+            &header[16..],
+            &[192, 0, 2, 1, 198, 51, 100, 2, 4, 210, 1, 187]
+        );
     }
 }
 

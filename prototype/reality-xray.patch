@@ -12,7 +12,7 @@ index 80a3871a..3d282b98 100644
  ], default-features = false }
  webpki-roots = "1.0.9"
 diff --git a/rustls-aws-lc-rs/src/reality.rs b/rustls-aws-lc-rs/src/reality.rs
-index 3a1f0f92..99978fe6 100644
+index 3a1f0f92..4ca19073 100644
 --- a/rustls-aws-lc-rs/src/reality.rs
 +++ b/rustls-aws-lc-rs/src/reality.rs
 @@ -18,7 +18,7 @@ use rustls::client::danger::{
@@ -35,7 +35,7 @@ index 3a1f0f92..99978fe6 100644
      ServerCredentialResolver,
 @@ -36,6 +36,14 @@ use rustls::{ClientConfig, RootCertStore};
  use subtle::ConstantTimeEq;
-
+ 
  static REALITY_X25519_KX_GROUPS: &[&dyn SupportedKxGroup] = &[crate::kx_group::X25519];
 +static REALITY_CLIENT_KX_GROUPS: &[&dyn SupportedKxGroup] =
 +    &[crate::kx_group::X25519MLKEM768, crate::kx_group::X25519];
@@ -78,7 +78,7 @@ index 3a1f0f92..99978fe6 100644
 +        }
          Ok(VerifiedIdentity::assertion(identity.identity.clone()))
      }
-
+ 
 @@ -354,6 +374,7 @@ pub struct RealitySessionIdConfig {
  #[derive(Debug, Clone)]
  pub struct RealityServerVerifierConfig {
@@ -153,7 +153,7 @@ index 3a1f0f92..99978fe6 100644
 @@ -576,6 +637,13 @@ impl RealityServerVerifierConfig {
          self
      }
-
+ 
 +    /// Sets the inclusive bounds of the authenticated Xray client version.
 +    pub fn with_client_version_range(mut self, minimum: [u8; 3], maximum: [u8; 3]) -> Self {
 +        self.version = minimum;
@@ -175,7 +175,7 @@ index 3a1f0f92..99978fe6 100644
 @@ -751,11 +820,7 @@ impl AwsLcRsRealityClientHelloVerifier {
              ));
          }
-
+ 
 -        if plaintext[..3]
 -            .ct_eq(&self.version)
 -            .unwrap_u8()
@@ -197,7 +197,7 @@ index 3a1f0f92..99978fe6 100644
                  "REALITY server verifier rejected a stale timestamp".into(),
              ));
 @@ -829,6 +896,7 @@ impl ClientHelloVerifier for AwsLcRsRealityClientHelloVerifier {
-
+ 
      fn hash_config(&self, h: &mut dyn Hasher) {
          h.write(&self.version);
 +        h.write(&self.max_client_version);
@@ -212,10 +212,10 @@ index 3a1f0f92..99978fe6 100644
      use rustls::client::danger::{
          HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
          VerifiedIdentity,
-@@ -1285,6 +1352,88 @@ mod tests {
+@@ -1285,6 +1352,93 @@ mod tests {
              .collect()
      }
-
+ 
 +    #[test]
 +    fn outbound_browser_profiles_emit_distinct_reality_client_hellos() {
 +        let private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
@@ -267,7 +267,9 @@ index 3a1f0f92..99978fe6 100644
 +    #[test]
 +    fn outbound_firefox_completes_handshake_when_peer_selects_p256() {
 +        let private_key = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
-+        let public_key = private_key.compute_public_key().unwrap();
++        let public_key = private_key
++            .compute_public_key()
++            .unwrap();
 +        let client_config =
 +            RealitySessionIdConfig::new([26, 11, 9], [1], public_key.as_ref().to_vec())
 +                .build_browser_client_config(ClientHelloProfile::Firefox148, test_root_store())
@@ -293,7 +295,10 @@ index 3a1f0f92..99978fe6 100644
 +            &mut server,
 +        );
 +        assert_eq!(
-+            client.negotiated_key_exchange_group().unwrap().name(),
++            client
++                .negotiated_key_exchange_group()
++                .unwrap()
++                .name(),
 +            NamedGroup::secp256r1
 +        );
 +    }
@@ -301,10 +306,10 @@ index 3a1f0f92..99978fe6 100644
      #[test]
      fn reality_client_hello_profile_wire_baseline() {
          for profile in [
-@@ -1481,6 +1630,43 @@ mod tests {
+@@ -1481,6 +1635,43 @@ mod tests {
          );
      }
-
+ 
 +    #[test]
 +    fn reality_server_verifier_accepts_go_cert_without_san_only_with_authentication() {
 +        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -386,7 +391,7 @@ index 8b67f8ba..3295a4cc 100644
 +            ],
          }
      }
-
+ 
 @@ -246,6 +261,18 @@ impl ClientHelloProfile {
                  NamedGroup::secp384r1,
              ],
@@ -405,7 +410,7 @@ index 8b67f8ba..3295a4cc 100644
 +            ],
          }
      }
-
+ 
 @@ -259,6 +286,28 @@ impl ClientHelloProfile {
                  SignatureScheme::RSA_PSS_SHA384,
                  SignatureScheme::ED25519,
@@ -479,7 +484,7 @@ index 8b67f8ba..3295a4cc 100644
                  ExtensionType::GREASE,
 @@ -313,7 +397,11 @@ impl ClientHelloProfile {
      }
-
+ 
      pub(crate) fn uses_grease(self) -> bool {
 -        !matches!(self, Self::Default)
 +        !matches!(self, Self::Default | Self::Firefox148)
@@ -489,7 +494,7 @@ index 8b67f8ba..3295a4cc 100644
 +        matches!(self, Self::Firefox148 | Self::Edge)
      }
  }
-
+ 
 diff --git a/rustls/src/client/ech.rs b/rustls/src/client/ech.rs
 index 2fb313b2..18c489a7 100644
 --- a/rustls/src/client/ech.rs
@@ -503,7 +508,7 @@ index 2fb313b2..18c489a7 100644
                      tls12: false,
                  }),
 diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
-index c4c27be3..32dbdb3a 100644
+index c4c27be3..6be4cd5e 100644
 --- a/rustls/src/client/hs.rs
 +++ b/rustls/src/client/hs.rs
 @@ -10,17 +10,19 @@ use pki_types::ServerName;
@@ -556,7 +561,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -308,7 +311,14 @@ impl ExpectServerHelloOrHelloRetryRequest {
                  .as_hybrid_checked(&config.provider().kx_groups, ProtocolVersion::TLSv1_3)
                  .map(|(hybrid, _)| hybrid.component().0);
-
+ 
 -            if req_group == offered_key_share.share.group() || Some(req_group) == offered_hybrid {
 +            if req_group == offered_key_share.share.group()
 +                || Some(req_group) == offered_hybrid
@@ -572,7 +577,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -583,6 +593,38 @@ fn grease_value(secure_random: &dyn crate::crypto::SecureRandom) -> Result<u16,
      Ok(nibble * 0x1010 + 0x0a0a)
  }
-
+ 
 +fn firefox_reality_grease_ech(provider: &CryptoProvider) -> Result<EncryptedClientHello, Error> {
 +    // The Firefox uTLS profile sends a dummy X25519 encapsulation and a
 +    // 223-byte inner payload plus the AEAD's 16-byte tag.
@@ -630,7 +635,7 @@ index c4c27be3..32dbdb3a 100644
      // Defense in depth: the ECH state should be None if ECH is disabled based on config
      // builder semantics.
      let forbids_tls12 = input.protocol.is_quic() || ech_state.is_some();
-
+ 
      let supported_versions = SupportedProtocolVersions {
 +        grease: if edge_grease {
 +            Some(ProtocolVersion(grease_value(
@@ -644,7 +649,7 @@ index c4c27be3..32dbdb3a 100644
      };
 @@ -613,13 +677,13 @@ fn emit_client_hello_for_retry(
      assert!(supported_versions.any(|_| true));
-
+ 
      let mut exts = Box::new(ClientExtensions {
 -        certificate_status_request: match config
 +        certificate_status_request: (config
@@ -713,7 +718,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -687,6 +763,13 @@ fn emit_client_hello_for_retry(
          exts.grease_extension = Some(ExtensionType(grease.expect("GREASE value is present")));
      }
-
+ 
 +    if config
 +        .client_hello_profile
 +        .sends_renegotiation_info()
@@ -727,7 +732,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -735,6 +818,7 @@ fn emit_client_hello_for_retry(
          (None, false) => None,
      };
-
+ 
 +    let mut additional_key_share = None;
      if let Some(GroupAndKeyShare { share, .. }) = &key_share {
          debug_assert!(supported_versions.tls13);
@@ -735,7 +740,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -755,6 +839,27 @@ fn emit_client_hello_for_retry(
              }
          }
-
+ 
 +        if reality_browser_hello
 +            && firefox_profile
 +            && let Some(group) = config
@@ -759,11 +764,11 @@ index c4c27be3..32dbdb3a 100644
 +        }
          exts.key_shares = Some(shares);
      }
-
+ 
 @@ -836,6 +941,61 @@ fn emit_client_hello_for_retry(
          _ => (None, false),
      };
-
+ 
 +    if reality_browser_hello {
 +        if edge_profile || firefox_profile {
 +            exts.sct_request = Some(());
@@ -794,8 +799,8 @@ index c4c27be3..32dbdb3a 100644
 +            );
 +            exts.signature_schemes = Some(
 +                [
-+                    0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
-+                    0x0601, 0x0203, 0x0201,
++                    0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203,
++                    0x0201,
 +                ]
 +                .into_iter()
 +                .map(SignatureScheme)
@@ -832,7 +837,7 @@ index c4c27be3..32dbdb3a 100644
 +            CipherSuite(grease_cipher.expect("GREASE value is present")),
 +        );
      }
-
+ 
 -    if supported_versions.tls12 {
 +    if supported_versions.tls12
 +        && !config
@@ -842,12 +847,12 @@ index c4c27be3..32dbdb3a 100644
          // We don't do renegotiation at all, in fact.
          cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
      }
-
+ 
 +    if reality_browser_hello && firefox_profile {
 +        cipher_suites.extend(
 +            [
-+                0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a, 0xc009, 0xc013,
-+                0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
++                0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a, 0xc009, 0xc013, 0xc014,
++                0x009c, 0x009d, 0x002f, 0x0035,
 +            ]
 +            .into_iter()
 +            .map(CipherSuite),
@@ -860,7 +865,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -891,7 +1069,7 @@ fn emit_client_hello_for_retry(
          extensions: exts,
      };
-
+ 
 -    let ech_grease_ext = config
 +    let mut ech_grease_ext = config
          .ech_mode
@@ -869,7 +874,7 @@ index c4c27be3..32dbdb3a 100644
 @@ -903,6 +1081,10 @@ fn emit_client_hello_for_retry(
              _ => None,
          });
-
+ 
 +    if reality_browser_hello && firefox_profile && config.ech_mode.is_none() {
 +        ech_grease_ext = Some(firefox_reality_grease_ech(config.provider()));
 +    }
@@ -891,7 +896,7 @@ index 0659961e..e4e7afd5 100644
 +++ b/rustls/src/client/tls13.rs
 @@ -127,7 +127,11 @@ impl ClientHandler<Tls13CipherSuite> for Handler {
          };
-
+ 
          // We always send a key share when TLS 1.3 is enabled.
 -        let our_key_share = st.offered_key_share.unwrap();
 +        let our_key_share = st
@@ -901,7 +906,7 @@ index 0659961e..e4e7afd5 100644
 +            .unwrap();
          let our_key_share = KeyExchangeChoice::new(&config, output, our_key_share, their_key_share)
              .map_err(|_| PeerMisbehaved::WrongGroupForKeyShare)?;
-
+ 
 diff --git a/rustls/src/crypto/kx/mod.rs b/rustls/src/crypto/kx/mod.rs
 index 1f640ff1..a2b06e8b 100644
 --- a/rustls/src/crypto/kx/mod.rs
@@ -909,7 +914,7 @@ index 1f640ff1..a2b06e8b 100644
 @@ -129,6 +129,11 @@ impl ActiveKeyExchange for ActiveHybrid {
          &self.combined_pub_key
      }
-
+ 
 +    fn extract_reality_key(&self, server_pub_key: &[u8]) -> Option<Vec<u8>> {
 +        self.classical
 +            .extract_reality_key(server_pub_key)
@@ -925,7 +930,7 @@ index 7837d0b4..d540571b 100644
 @@ -179,10 +179,22 @@ extension_struct! {
          ExtensionType::ExtendedMainSecret =>
              pub(crate) extended_main_secret_request: Option<()>,
-
+ 
 +        /// Request signed certificate timestamps (RFC 6962).
 +        ExtensionType::SCT =>
 +            pub(crate) sct_request: Option<()>,
@@ -937,7 +942,7 @@ index 7837d0b4..d540571b 100644
          /// Offered certificate compression methods (RFC 8879)
          ExtensionType::CompressCertificate =>
              pub(crate) certificate_compression_algorithms: Option<Vec<CertificateCompressionAlgorithm>>,
-
+ 
 +        /// Delegated credential signature schemes (RFC 9345).
 +        ExtensionType::DelegatedCredentials =>
 +            pub(crate) delegated_credentials: Option<Vec<SignatureScheme>>,
@@ -946,7 +951,7 @@ index 7837d0b4..d540571b 100644
          ExtensionType::SessionTicket =>
              pub(crate) session_ticket: Option<ClientSessionTicket>,
 @@ -244,19 +256,23 @@ extension_struct! {
-
+ 
          /// The per-ClientHello GREASE extension type, when enabled.
          pub(crate) grease_extension: Option<ExtensionType>,
 +
@@ -954,7 +959,7 @@ index 7837d0b4..d540571b 100644
 +        pub(crate) grease_extension_tail: Option<ExtensionType>,
      }
  }
-
+ 
  impl ClientExtensions<'_> {
      pub(crate) fn set_extension_order(&mut self, preferred: &[ExtensionType]) {
          let mut used = self.collect_used();
@@ -994,7 +999,7 @@ index 7837d0b4..d540571b 100644
 +            delegated_credentials,
          }
      }
-
+ 
 @@ -363,9 +387,8 @@ impl ClientExtensions<'_> {
      ///   are required to be last by the standard.
      fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
@@ -1004,7 +1009,7 @@ index 7837d0b4..d540571b 100644
 -        }
 +        order.extend(self.grease_extension);
 +        order.extend(self.grease_extension_tail);
-
+ 
          // Remove extensions which have specific order requirements.
          order.retain(|ext| {
 @@ -399,6 +422,9 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
@@ -1035,7 +1040,7 @@ index d2d41e55..0eca8de4 100644
      /// The reserved GREASE extension value from RFC 8701.
      pub(crate) const GREASE: Self = Self(0x0a0a);
 +    pub(crate) const GREASE_TAIL: Self = Self(0x1a1a);
-
+ 
      pub(crate) fn is_grease(self) -> bool {
          u16::from(self) & 0x0f0f == 0x0a0a
 diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
@@ -1063,7 +1068,7 @@ index 95791594..d7ce4d32 100644
 @@ -331,7 +335,11 @@ impl Codec<'_> for SupportedProtocolVersions {
              };
          }
-
+ 
 -        Ok(Self { tls13, tls12 })
 +        Ok(Self {
 +            grease: None,
@@ -1072,7 +1077,7 @@ index 95791594..d7ce4d32 100644
 +        })
      }
  }
-
+ 
 diff --git a/rustls/src/msgs/handshake_test.rs b/rustls/src/msgs/handshake_test.rs
 index 88775502..fc6a45d6 100644
 --- a/rustls/src/msgs/handshake_test.rs
@@ -1113,7 +1118,7 @@ index 1af822c7..6a5ad612 100644
 @@ -353,18 +353,16 @@ impl ClientVerifier for WebPkiClientVerifier {
              )
          };
-
+ 
 -        cert.0
 -            .verify_for_usage(
 -                self.supported_algs.all,
@@ -1137,7 +1142,7 @@ index 1af822c7..6a5ad612 100644
 +        .map_err(pki_error)
 +        .map(|_| VerifiedIdentity::assertion(identity.identity.clone()))
      }
-
+ 
      fn verify_tls12_signature(
 diff --git a/rustls/src/webpki/verify.rs b/rustls/src/webpki/verify.rs
 index 67eca519..4c3d554d 100644

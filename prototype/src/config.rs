@@ -678,12 +678,19 @@ impl StreamSettings {
                     "unexpected transport settings or PROXY protocol on TLS WebSocket inbound"
                 );
                 let settings = self.ws_settings.take().context("missing wsSettings")?;
-                ensure!(settings.path.starts_with('/'), "WebSocket path must start with '/'");
+                ensure!(
+                    settings.path.starts_with('/'),
+                    "WebSocket path must start with '/'"
+                );
                 ensure!(
                     !settings.accept_proxy_protocol,
                     "PROXY protocol is unsupported on TLS WebSocket inbound"
                 );
-                let tls = self.tls_settings.take().context("missing tlsSettings")?.compile()?;
+                let tls = self
+                    .tls_settings
+                    .take()
+                    .context("missing tlsSettings")?
+                    .compile()?;
                 Ok(Transport::WebSocketTls { tls, settings })
             }
             ("grpc", "" | "none") => {

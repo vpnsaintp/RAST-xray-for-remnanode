@@ -4,6 +4,10 @@ version = "26.11.9"
 edition = "2024"
 publish = false
 
+# This compatibility prototype is built independently from the production
+# workspace; its patched REALITY/rustls graph intentionally differs.
+[workspace]
+
 [dependencies]
 anyhow = "1"
 aws-lc-rs = "1"

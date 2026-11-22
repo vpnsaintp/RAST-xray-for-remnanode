@@ -35,8 +35,8 @@ use state::{Meter, Metered, Traffic};
 use subtle::ConstantTimeEq;
 use tls_stream::{SpliceReader, TlsStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -61,7 +61,10 @@ async fn main() -> Result<()> {
     } else {
         false
     };
-    let path = if args.first().is_some_and(|arg| arg == "-config" || arg == "-c") {
+    let path = if args
+        .first()
+        .is_some_and(|arg| arg == "-config" || arg == "-c")
+    {
         args.remove(0);
         ensure!(!args.is_empty(), "missing config path");
         args.remove(0)
@@ -420,9 +423,14 @@ enum RealityConnection {
     Unix(UnixStream),
 }
 
-async fn connect_reality_target(target: &RealityTarget, listener: SocketAddr) -> Result<RealityConnection> {
+async fn connect_reality_target(
+    target: &RealityTarget,
+    listener: SocketAddr,
+) -> Result<RealityConnection> {
     match target {
-        RealityTarget::Address(address) => Ok(RealityConnection::Tcp(TcpStream::connect(address).await?)),
+        RealityTarget::Address(address) => {
+            Ok(RealityConnection::Tcp(TcpStream::connect(address).await?))
+        }
         RealityTarget::Domain(target) => {
             let mut addresses = target.addresses().await?;
             addresses.retain(|address| canonical_address(*address) != listener);
@@ -430,7 +438,9 @@ async fn connect_reality_target(target: &RealityTarget, listener: SocketAddr) ->
                 !addresses.is_empty(),
                 "REALITY fallback has no usable address"
             );
-            Ok(RealityConnection::Tcp(TcpStream::connect(addresses.as_slice()).await?))
+            Ok(RealityConnection::Tcp(
+                TcpStream::connect(addresses.as_slice()).await?,
+            ))
         }
         RealityTarget::Unix(path) => Ok(RealityConnection::Unix(UnixStream::connect(path).await?)),
     }
@@ -720,7 +730,9 @@ async fn relay_raw_uplink(
         match splice::copy(&read, &socket, |size| {
             meter.add(size, true);
             progress.add(size);
-        }).await? {
+        })
+        .await?
+        {
             splice::Transfer::Complete => return Ok(()),
             splice::Transfer::Buffered(tail) => write.write_all(&tail).await?,
         }
@@ -822,7 +834,8 @@ async fn relay_sniffed_tcp(
             tokio::io::copy(&mut read, &mut destination).await?;
             if let Some(raw_input) = raw_input {
                 if let Ok(socket) = raw_input.await {
-                    relay_raw_uplink(socket, &mut destination, raw_target, &uplink_progress).await?;
+                    relay_raw_uplink(socket, &mut destination, raw_target, &uplink_progress)
+                        .await?;
                 }
             }
             destination.shutdown().await?;

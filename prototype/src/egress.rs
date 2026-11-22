@@ -145,7 +145,10 @@ impl Direct {
             "unsupported freedom transport"
         );
         ensure!(
-            matches!(direct.target_strategy.as_str(), "" | "AsIs" | "ForceIPv4" | "UseIPv4"),
+            matches!(
+                direct.target_strategy.as_str(),
+                "" | "AsIs" | "ForceIPv4" | "UseIPv4"
+            ),
             "unsupported freedom strategy"
         );
         stream.sockopt.validate()?;
@@ -164,7 +167,8 @@ impl Direct {
         target: &Target,
         legacy_fixture: bool,
     ) -> Result<Vec<SocketAddr>> {
-        let force_v4 = matches!(self.target_strategy.as_str(), "ForceIPv4" | "UseIPv4") || self.sockopt.force_ipv4();
+        let force_v4 = matches!(self.target_strategy.as_str(), "ForceIPv4" | "UseIPv4")
+            || self.sockopt.force_ipv4();
         let mut addresses = router.resolve(target, force_v4, force_v4).await?;
         addresses.retain(|address| {
             let matched = self.final_rules.iter().find(|rule| {
@@ -563,7 +567,10 @@ impl VlessProxy {
                     stream.tls_settings.is_none() && stream.reality_settings.is_none(),
                     "security settings on a plain VLESS cascade"
                 );
-                ensure!(!vision, "Vision requires TLS or REALITY on the VLESS cascade");
+                ensure!(
+                    !vision,
+                    "Vision requires TLS or REALITY on the VLESS cascade"
+                );
                 VlessSecurity::Plain
             }
             "tls" => {

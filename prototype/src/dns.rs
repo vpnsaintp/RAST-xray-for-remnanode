@@ -191,7 +191,7 @@ impl Resolver {
                     }) => {
                         ensure!(!skip_fallback, "DNS skipFallback=true is not supported");
                         (address, port, domains)
-                    },
+                    }
                 };
                 let address = if address == "localhost" {
                     ServerAddress::System
@@ -219,7 +219,10 @@ impl Resolver {
             .any(|server| matches!(server.address, ServerAddress::Tls(_)))
             .then(system_tls_config)
             .transpose()?;
-        let doh_tls = if servers.iter().any(|server| matches!(server.address, ServerAddress::Https(_))) {
+        let doh_tls = if servers
+            .iter()
+            .any(|server| matches!(server.address, ServerAddress::Https(_)))
+        {
             let mut config = (*system_tls_config()?).clone();
             config.alpn_protocols = vec![b"h2".as_slice().into()];
             Some(Arc::new(config))
@@ -452,13 +455,9 @@ async fn exchange(
                 .collect();
             ensure!(!addresses.is_empty(), "DoH upstream is blocked by routing");
             let socket = TcpStream::connect(addresses.as_slice()).await?;
-            let stream = TlsStream::connect(
-                socket,
-                tls.clone(),
-                upstream.tls.server_name.clone(),
-            )
-            .await
-            .context("DoH TLS handshake failed")?;
+            let stream = TlsStream::connect(socket, tls.clone(), upstream.tls.server_name.clone())
+                .await
+                .context("DoH TLS handshake failed")?;
             let (mut sender, connection) = h2::client::handshake(stream).await?;
             let driver = tokio::spawn(async move { connection.await });
             let result = async {
@@ -471,7 +470,10 @@ async fn exchange(
                 let (response, mut body) = sender.send_request(request, false)?;
                 body.send_data(bytes.clone().into(), true)?;
                 let response = response.await?;
-                ensure!(response.status().is_success(), "DoH upstream returned HTTP error");
+                ensure!(
+                    response.status().is_success(),
+                    "DoH upstream returned HTTP error"
+                );
                 let mut body = response.into_body();
                 let mut answer = Vec::new();
                 while let Some(chunk) = body.data().await {

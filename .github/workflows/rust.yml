@@ -18,6 +18,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+          targets: x86_64-unknown-linux-musl
+      - name: Установить musl linker
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends musl-tools
       - name: Получить закреплённую зависимость REALITY
         run: |
           git clone https://github.com/ssrlive/reality-rs.git reality-rs
@@ -30,14 +33,20 @@ jobs:
       - name: Собрать и выполнить Rust-тесты
         working-directory: prototype
         run: cargo test --locked --release
-      - name: Собрать пилотный бинарник
+      - name: Собрать статический пилотный бинарник
         working-directory: prototype
-        run: cargo build --locked --release
-      - name: Сохранить пилотный бинарник
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Проверить статическую линковку
+        run: |
+          binary=prototype/target/x86_64-unknown-linux-musl/release/nightvpn-xray-rust-prototype
+          test -x "$binary"
+          ! readelf -l "$binary" | grep -F 'Requesting program interpreter'
+          ! readelf -d "$binary" | grep -F '(NEEDED)'
+      - name: Сохранить статический пилотный бинарник
         uses: actions/upload-artifact@v4
         with:
-          name: remnanode-prototype-${{ github.event.pull_request.head.sha || github.sha }}
-          path: prototype/target/release/nightvpn-xray-rust-prototype
+          name: remnanode-prototype-musl-${{ github.event.pull_request.head.sha || github.sha }}
+          path: prototype/target/x86_64-unknown-linux-musl/release/nightvpn-xray-rust-prototype
           if-no-files-found: error
           retention-days: 7
       - name: Проверить синтаксис Python-тестов

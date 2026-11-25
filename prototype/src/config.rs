@@ -27,6 +27,9 @@ use crate::routing::{Host, Outbound, Router, RoutingConfig, Target};
 use crate::sniff::Sniffing;
 use crate::state::{State, Traffic, User, Users, VISION};
 
+const USER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const USER_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct Inbound {
     pub tag: String,
     pub address: SocketAddr,
@@ -455,6 +458,218 @@ async fn fetch(reference: &str) -> Result<Vec<u8>> {
         );
     }
     Ok(response.split_off(head + 4))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UserReconcileResult {
+    pub added: usize,
+    pub removed: usize,
+    pub replaced: usize,
+}
+
+fn reconcile_users_from_profile(
+    value: serde_json::Value,
+    state: &State,
+) -> Result<UserReconcileResult> {
+    let profile: Profile = serde_json::from_value(value).context("decode Xray profile")?;
+    let mut desired = HashMap::<String, HashMap<Uuid, User>>::new();
+
+    for value in profile.inbounds {
+        if value["protocol"].as_str() != Some("vless") {
+            continue;
+        }
+        let inbound: VlessInbound =
+            serde_json::from_value(value).context("decode VLESS users for reconciliation")?;
+        let mut users = HashMap::new();
+        for client in inbound.settings.clients {
+            ensure!(client.level == 0, "unsupported client level");
+            let id = Uuid::parse_str(&client.id).context("invalid client UUID")?;
+            let flow = if client.flow.is_empty() {
+                &inbound.settings.flow
+            } else {
+                &client.flow
+            };
+            ensure!(
+                users.insert(id, User::new(client.email, flow)?).is_none(),
+                "duplicate client UUID"
+            );
+        }
+        ensure!(
+            desired.insert(inbound.tag, users).is_none(),
+            "duplicate inbound tag"
+        );
+    }
+
+    ensure!(
+        desired.len() == state.inbounds.len()
+            && state.inbounds.keys().all(|tag| desired.contains_key(tag)),
+        "reconciliation profile does not match active VLESS inbounds"
+    );
+
+    let mut result = UserReconcileResult::default();
+    for (tag, expected) in desired {
+        let active = state.inbounds.get(&tag).context("active inbound missing")?;
+        let mut active = active.write().unwrap();
+
+        let removed = active
+            .keys()
+            .filter(|id| !expected.contains_key(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in removed {
+            if let Some(user) = active.remove(&id) {
+                user.cancel();
+                state.stats.remove_online(&user.email);
+                result.removed += 1;
+            }
+        }
+
+        for (id, expected_user) in expected {
+            match active.get(&id) {
+                Some(current)
+                    if current.email == expected_user.email
+                        && current.vision == expected_user.vision => {}
+                Some(_) => {
+                    if let Some(old) = active.insert(id, expected_user) {
+                        old.cancel();
+                        state.stats.remove_online(&old.email);
+                    }
+                    result.replaced += 1;
+                }
+                None => {
+                    active.insert(id, expected_user);
+                    result.added += 1;
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub async fn keep_users_synced(reference: String, state: Arc<State>) -> Result<()> {
+    let mut interval = tokio::time::interval(USER_RECONCILE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let update = tokio::time::timeout(USER_RECONCILE_TIMEOUT, fetch(&reference)).await;
+        let result = match update {
+            Ok(Ok(bytes)) => serde_json::from_slice(&bytes)
+                .context("decode reconciliation config JSON")
+                .and_then(|value| reconcile_users_from_profile(value, &state)),
+            Ok(Err(error)) => Err(error.context("fetch reconciliation config")),
+            Err(_) => Err(anyhow::anyhow!("reconciliation config request timed out")),
+        };
+        match result {
+            Ok(changes) if changes != UserReconcileResult::default() => eprintln!(
+                "user reconciliation: added={}, removed={}, replaced={}",
+                changes.added, changes.removed, changes.replaced
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("user reconciliation skipped: {error:#}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_reconcile_tests {
+    use super::*;
+
+    fn state(users: HashMap<Uuid, User>) -> State {
+        State {
+            inbounds: HashMap::from([(
+                "edge".to_owned(),
+                Arc::new(RwLock::new(users)),
+            )]),
+            shadowsocks: HashMap::new(),
+            stats: Arc::new(Traffic::default()),
+            started: Instant::now(),
+        }
+    }
+
+    fn profile(clients: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "inbounds": [{
+                "protocol": "vless",
+                "tag": "edge",
+                "port": 443,
+                "settings": {
+                    "decryption": "none",
+                    "clients": clients
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "none"
+                }
+            }],
+            "outbounds": []
+        })
+    }
+
+    #[tokio::test]
+    async fn reconciles_added_removed_and_changed_users_without_restart() {
+        let removed_id = Uuid::new_v4();
+        let replaced_id = Uuid::new_v4();
+        let added_id = Uuid::new_v4();
+        let removed = User::new("removed".into(), "").unwrap();
+        let replaced = User::new("old-email".into(), "").unwrap();
+        let removed_signal = removed.clone();
+        let replaced_signal = replaced.clone();
+        let state = state(HashMap::from([
+            (removed_id, removed),
+            (replaced_id, replaced),
+        ]));
+
+        let result = reconcile_users_from_profile(
+            profile(serde_json::json!([
+                {
+                    "id": replaced_id.to_string(),
+                    "email": "new-email",
+                    "flow": "xtls-rprx-vision"
+                },
+                {"id": added_id.to_string(), "email": "added"}
+            ])),
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            UserReconcileResult {
+                added: 1,
+                removed: 1,
+                replaced: 1,
+            }
+        );
+        let active = state.inbounds["edge"].read().unwrap();
+        assert!(!active.contains_key(&removed_id));
+        assert_eq!(active[&replaced_id].email, "new-email");
+        assert!(active[&replaced_id].vision);
+        assert_eq!(active[&added_id].email, "added");
+        drop(active);
+        tokio::time::timeout(Duration::from_millis(10), removed_signal.revoked())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(10), replaced_signal.revoked())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_snapshot_without_mutating_active_users() {
+        let id = Uuid::new_v4();
+        let state = state(HashMap::from([(
+            id,
+            User::new("preserved".into(), "").unwrap(),
+        )]));
+
+        let result = reconcile_users_from_profile(
+            serde_json::json!({"inbounds": [], "outbounds": []}),
+            &state,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(state.inbounds["edge"].read().unwrap()[&id].email, "preserved");
+    }
 }
 
 fn from_legacy(config: LegacyConfig) -> Result<Config> {

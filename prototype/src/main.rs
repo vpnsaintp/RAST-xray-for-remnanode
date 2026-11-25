@@ -47,6 +47,51 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INBOUND_CONNECTIONS: usize = 32_768;
 const LISTEN_BACKLOG: i32 = 65_535;
 
+fn remnanode_api_socket(configured: Option<String>, environment: Option<String>) -> Option<String> {
+    configured.or_else(|| {
+        environment.and_then(|name| {
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else if name.starts_with('@') {
+                Some(name.to_owned())
+            } else {
+                Some(format!("@{name}"))
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod remnanode_api_socket_tests {
+    use super::remnanode_api_socket;
+
+    #[test]
+    fn keeps_socket_from_injected_api_inbound() {
+        assert_eq!(
+            remnanode_api_socket(Some("@profile-api".into()), Some("env-api".into())),
+            Some("@profile-api".into())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_remnanode_environment_socket() {
+        assert_eq!(
+            remnanode_api_socket(None, Some("xtls-api-runtime".into())),
+            Some("@xtls-api-runtime".into())
+        );
+        assert_eq!(
+            remnanode_api_socket(None, Some("@xtls-api-runtime".into())),
+            Some("@xtls-api-runtime".into())
+        );
+    }
+
+    #[test]
+    fn ignores_empty_environment_socket() {
+        assert_eq!(remnanode_api_socket(None, Some("  ".into())), None);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -83,6 +128,12 @@ async fn main() -> Result<()> {
     }
     config.state.stats.start_clock();
     let mut services = JoinSet::new();
+    if path.starts_with('@') {
+        services.spawn(config::keep_users_synced(
+            path.clone(),
+            config.state.clone(),
+        ));
+    }
     for inbound in config.inbounds {
         let listener = bind(&inbound)?;
         let backend = config.backend.clone();
@@ -96,7 +147,11 @@ async fn main() -> Result<()> {
             config.state.stats.clone(),
         )?;
     }
-    if let Some(name) = config.api_socket {
+    let api_socket = remnanode_api_socket(
+        config.api_socket.take(),
+        std::env::var("XTLS_API_SOCKET_PATH").ok(),
+    );
+    if let Some(name) = api_socket {
         services.spawn(api::serve(name, config.state, config.backend.clone()));
     }
     use tokio::signal::unix::{SignalKind, signal};

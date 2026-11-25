@@ -44,6 +44,7 @@ impl User {
 pub struct State {
     pub inbounds: HashMap<String, Arc<Users>>,
     pub shadowsocks: HashMap<String, Arc<crate::shadowsocks::Users>>,
+    pub mutations: tokio::sync::Mutex<()>,
     pub stats: Arc<Traffic>,
     pub started: Instant,
 }

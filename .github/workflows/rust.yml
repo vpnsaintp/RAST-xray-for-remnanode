@@ -30,6 +30,16 @@ jobs:
       - name: Собрать и выполнить Rust-тесты
         working-directory: prototype
         run: cargo test --locked --release
+      - name: Собрать пилотный бинарник
+        working-directory: prototype
+        run: cargo build --locked --release
+      - name: Сохранить пилотный бинарник
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnanode-prototype-${{ github.event.pull_request.head.sha || github.sha }}
+          path: prototype/target/release/nightvpn-xray-rust-prototype
+          if-no-files-found: error
+          retention-days: 7
       - name: Проверить синтаксис Python-тестов
         run: python3 -m py_compile install.py prototype/test_interop.py prototype/test_node_client.py prototype/test_remnawave.py
       - name: Проверить установщик без работающей ноды

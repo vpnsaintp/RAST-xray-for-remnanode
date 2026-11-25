@@ -553,9 +553,15 @@ pub async fn keep_users_synced(reference: String, state: Arc<State>) -> Result<(
         interval.tick().await;
         let update = tokio::time::timeout(USER_RECONCILE_TIMEOUT, fetch(&reference)).await;
         let result = match update {
-            Ok(Ok(bytes)) => serde_json::from_slice(&bytes)
+            Ok(Ok(bytes)) => match serde_json::from_slice(&bytes)
                 .context("decode reconciliation config JSON")
-                .and_then(|value| reconcile_users_from_profile(value, &state)),
+            {
+                Ok(value) => {
+                    let _guard = state.mutations.lock().await;
+                    reconcile_users_from_profile(value, &state)
+                }
+                Err(error) => Err(error),
+            },
             Ok(Err(error)) => Err(error.context("fetch reconciliation config")),
             Err(_) => Err(anyhow::anyhow!("reconciliation config request timed out")),
         };
@@ -578,6 +584,7 @@ mod user_reconcile_tests {
         State {
             inbounds: HashMap::from([("edge".to_owned(), Arc::new(RwLock::new(users)))]),
             shadowsocks: HashMap::new(),
+            mutations: tokio::sync::Mutex::new(()),
             stats: Arc::new(Traffic::default()),
             started: Instant::now(),
         }
@@ -1084,6 +1091,7 @@ fn assemble(
             .iter()
             .map(|inbound| (inbound.tag.clone(), inbound.users.clone()))
             .collect(),
+        mutations: tokio::sync::Mutex::new(()),
         stats: Arc::new(Traffic::default()),
         started: Instant::now(),
     };

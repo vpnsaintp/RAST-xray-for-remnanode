@@ -36,7 +36,6 @@ use stats::{
 struct Api {
     state: Arc<State>,
     backend: Arc<Backend>,
-    mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Api {
@@ -130,7 +129,6 @@ pub async fn serve(name: String, state: Arc<State>, backend: Arc<Backend>) -> Re
     let api = Api {
         state,
         backend,
-        mutations: Arc::new(tokio::sync::Mutex::new(())),
     };
     // Remnanode and the core run under the same UID. Abstract sockets have no
     // filesystem permissions, so reject other UIDs before starting gRPC.
@@ -162,7 +160,7 @@ impl HandlerService for Api {
         request: Request<RemoveOutboundRequest>,
     ) -> Result<Response<RemoveOutboundResponse>, Status> {
         let request = request.into_inner();
-        let _guard = self.mutations.lock().await;
+        let _guard = self.state.mutations.lock().await;
         if let Backend::Native(router) = self.backend.as_ref() {
             if request.tag == TORRENT_OUTBOUND {
                 router.disable_torrent();
@@ -202,7 +200,7 @@ impl HandlerService for Api {
         let op = request
             .operation
             .ok_or_else(|| Status::invalid_argument("operation missing"))?;
-        let _guard = self.mutations.lock().await;
+        let _guard = self.state.mutations.lock().await;
         if let Some(users) = self.state.shadowsocks.get(&request.tag) {
             return self.alter_shadowsocks(users, op);
         }

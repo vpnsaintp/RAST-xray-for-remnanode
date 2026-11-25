@@ -126,10 +126,7 @@ pub async fn serve(name: String, state: Arc<State>, backend: Arc<Backend>) -> Re
     let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
     let listener = std::os::unix::net::UnixListener::bind_addr(&address)?;
     listener.set_nonblocking(true)?;
-    let api = Api {
-        state,
-        backend,
-    };
+    let api = Api { state, backend };
     // Remnanode and the core run under the same UID. Abstract sockets have no
     // filesystem permissions, so reject other UIDs before starting gRPC.
     let uid = unsafe { libc::geteuid() };

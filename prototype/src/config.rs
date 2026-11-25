@@ -553,15 +553,15 @@ pub async fn keep_users_synced(reference: String, state: Arc<State>) -> Result<(
         interval.tick().await;
         let update = tokio::time::timeout(USER_RECONCILE_TIMEOUT, fetch(&reference)).await;
         let result = match update {
-            Ok(Ok(bytes)) => match serde_json::from_slice(&bytes)
-                .context("decode reconciliation config JSON")
-            {
-                Ok(value) => {
-                    let _guard = state.mutations.lock().await;
-                    reconcile_users_from_profile(value, &state)
+            Ok(Ok(bytes)) => {
+                match serde_json::from_slice(&bytes).context("decode reconciliation config JSON") {
+                    Ok(value) => {
+                        let _guard = state.mutations.lock().await;
+                        reconcile_users_from_profile(value, &state)
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             Ok(Err(error)) => Err(error.context("fetch reconciliation config")),
             Err(_) => Err(anyhow::anyhow!("reconciliation config request timed out")),
         };

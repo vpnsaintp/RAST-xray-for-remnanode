@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
     config.state.stats.start_clock();
     let mut services = JoinSet::new();
     if path.starts_with('@') {
-        services.spawn(config::keep_users_synced(path.clone(), config.state.clone()));
+        services.spawn(config::keep_users_synced(
+            path.clone(),
+            config.state.clone(),
+        ));
     }
     for inbound in config.inbounds {
         let listener = bind(&inbound)?;

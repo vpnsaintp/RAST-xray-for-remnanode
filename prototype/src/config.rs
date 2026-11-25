@@ -576,10 +576,7 @@ mod user_reconcile_tests {
 
     fn state(users: HashMap<Uuid, User>) -> State {
         State {
-            inbounds: HashMap::from([(
-                "edge".to_owned(),
-                Arc::new(RwLock::new(users)),
-            )]),
+            inbounds: HashMap::from([("edge".to_owned(), Arc::new(RwLock::new(users)))]),
             shadowsocks: HashMap::new(),
             stats: Arc::new(Traffic::default()),
             started: Instant::now(),
@@ -668,7 +665,10 @@ mod user_reconcile_tests {
         );
 
         assert!(result.is_err());
-        assert_eq!(state.inbounds["edge"].read().unwrap()[&id].email, "preserved");
+        assert_eq!(
+            state.inbounds["edge"].read().unwrap()[&id].email,
+            "preserved"
+        );
     }
 }
 
